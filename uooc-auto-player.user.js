@@ -1,14 +1,19 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.3.3
-// @description  在优课在线学习页自动静音、2倍速、选择可用视频资源并连续播放下一个视频。
+// @version      0.4.0
+// @description  自动控制UOOC视频播放，并支持按题拆分导出当前测验的题目与选项。
 // @author       Liunian06
 // @match        *://www.uooc.net.cn/home/learn/*
 // @match        *://*.uooc.net.cn/home/learn/*
 // @match        *://*.uooconline.com/home/learn/*
 // @match        *://*.uooc.online/home/learn/*
+// @match        *://www.uooc.net.cn/exam/*
+// @match        *://*.uooc.net.cn/exam/*
+// @match        *://*.uooconline.com/exam/*
+// @match        *://*.uooc.online/exam/*
 // @run-at       document-start
+// @noframes
 // @grant        none
 // ==/UserScript==
 
@@ -89,6 +94,139 @@
     state.statusTimer = setTimeout(() => {
       box.style.display = 'none';
     }, timeout);
+  }
+
+  function getQuizDocuments() {
+    const documents = [document];
+    document.querySelectorAll('iframe').forEach((frame) => {
+      try {
+        if (frame.contentDocument && frame.contentDocument !== document) {
+          documents.push(frame.contentDocument);
+        }
+      } catch (_) {
+        // 跨域iframe无法读取时跳过，当前UOOC考试iframe通常与页面同源。
+      }
+    });
+    return documents;
+  }
+
+  function textFromElement(element) {
+    if (!element) return '';
+    const clone = element.cloneNode(true);
+    const ownerDocument = element.ownerDocument || document;
+    clone.querySelectorAll('script,style,input,button,textarea,select').forEach((node) => node.remove());
+    clone.querySelectorAll('br').forEach((node) => node.replaceWith(ownerDocument.createTextNode('\n')));
+    clone.querySelectorAll('img').forEach((image) => {
+      const label = image.getAttribute('alt') || image.getAttribute('title') || image.getAttribute('src') || '图片';
+      image.replaceWith(ownerDocument.createTextNode('[图片: ' + label + ']'));
+    });
+    return (clone.textContent || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function escapeMarkdown(text) {
+    return String(text || '')
+      .replace(/\\/g, '\\\\')
+      .replace(/\r?\n/g, '<br>')
+      .replace(/\|/g, '\\|');
+  }
+
+  function extractQuizQuestionsFromDocument(doc) {
+    const containers = Array.from(doc.querySelectorAll('.queContainer'));
+    return containers.map((container, index) => {
+      const group = container.closest('.queItems');
+      const typeNode = group && group.querySelector('.queItems-type');
+      const indexText = textFromElement(container.querySelector('.index')) || String(index + 1) + '.';
+      const number = indexText.replace(/\D/g, '') || String(index + 1);
+      const options = Array.from(container.querySelectorAll('.ti-a')).map((label, optionIndex) => {
+        const rawLabel = textFromElement(label.querySelector('.ti-a-i'));
+        const letterMatch = rawLabel.match(/[A-Z]/i);
+        return {
+          label: (letterMatch ? letterMatch[0] : 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[optionIndex] || String(optionIndex + 1)).toUpperCase(),
+          text: textFromElement(label.querySelector('.ti-a-c') || label),
+        };
+      }).filter((option) => option.text);
+      return {
+        number,
+        type: typeNode ? textFromElement(typeNode).replace(/\s*\(共[\s\S]*$/, '').trim() : '未分类',
+        question: textFromElement(container.querySelector('.ti-q-c')),
+        options,
+        score: textFromElement(container.querySelector('.scores')),
+        id: (container.querySelector('.index') || {}).id || (container.querySelector('input[name]') || {}).name || '',
+      };
+    }).filter((item) => item.question);
+  }
+
+  function findQuizQuestions() {
+    for (const doc of getQuizDocuments()) {
+      const questions = extractQuizQuestionsFromDocument(doc);
+      if (questions.length) {
+        return {
+          document: doc,
+          questions,
+          title: textFromElement(doc.querySelector('.testPaper-Top')) || doc.title || 'UOOC测验',
+        };
+      }
+    }
+    return null;
+  }
+
+  function downloadText(filename, content, mime = 'text/plain;charset=utf-8') {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.style.display = 'none';
+    (document.body || document.documentElement).appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function formatQuizMarkdown(result) {
+    const source = result.document.location && result.document.location.href ? result.document.location.href : location.href;
+    const lines = [
+      '# ' + (result.title || 'UOOC测验'),
+      '',
+      '- 导出时间：' + new Date().toLocaleString('zh-CN'),
+      '- 题目数量：' + result.questions.length,
+      '- 来源页面：' + source,
+      '',
+    ];
+    result.questions.forEach((item, index) => {
+      lines.push('## ' + (item.number || index + 1) + '. ' + item.type);
+      lines.push('');
+      lines.push('**题目：** ' + escapeMarkdown(item.question));
+      lines.push('');
+      item.options.forEach((option) => {
+        lines.push('- **' + option.label + '.** ' + escapeMarkdown(option.text));
+      });
+      if (item.score) {
+        lines.push('');
+        lines.push('> 分值：' + escapeMarkdown(item.score));
+      }
+      lines.push('');
+    });
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n');
+  }
+
+  function exportQuiz() {
+    const result = findQuizQuestions();
+    if (!result) {
+      notify('当前页面未找到可导出的题目');
+      return;
+    }
+    const safeTitle = (result.title || 'uooc-quiz')
+      .replace(/[\\/:*?"<>|]/g, '-')
+      .replace(/\s+/g, '-')
+      .slice(0, 80) || 'uooc-quiz';
+    downloadText(safeTitle + '.md', formatQuizMarkdown(result), 'text/markdown;charset=utf-8');
+    notify('已导出' + result.questions.length + '道题目');
   }
 
   function unique(values) {
@@ -889,6 +1027,9 @@
       '.fastuooc-auto-player-toggle-row.is-on .fastuooc-auto-player-toggle-switch{background:#22c55e;box-shadow:inset 0 0 0 1px rgba(21,128,61,.18)}',
       '.fastuooc-auto-player-toggle-row.is-on .fastuooc-auto-player-toggle-switch i{transform:translateX(17px)}',
       '.fastuooc-auto-player-toggle-row:disabled.is-on .fastuooc-auto-player-toggle-switch{background:var(--panel-muted);box-shadow:inset 0 0 0 1px rgba(100,116,139,.2)}',
+      '.fastuooc-auto-player-export{display:flex!important;align-items:center;justify-content:center;gap:7px;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:center}',
+      '.fastuooc-auto-player-export:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
+      '.fastuooc-auto-player-export svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}',
       '.fastuooc-auto-player-theme{display:flex!important;align-items:center;justify-content:space-between;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:left}',
       '.fastuooc-auto-player-theme:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
       '.fastuooc-auto-player-theme-value{color:var(--panel-muted);font-size:11px}',
@@ -931,6 +1072,10 @@
         '<span class="fastuooc-auto-player-toggle-label"><span>后台播放</span></span>',
         '<span class="fastuooc-auto-player-toggle-switch" aria-hidden="true"><i></i></span>',
         '</button>',
+        '<button class="fastuooc-auto-player-export" data-action="export" title="导出当前测验题目和选项" aria-label="导出当前测验题目和选项">',
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path></svg>',
+        '<span>导出题目</span>',
+        '</button>',
         '<button class="fastuooc-auto-player-theme" data-action="theme" title="切换界面主题：跟随系统、浅色、深色" aria-label="切换界面主题">',
         '<span>界面主题</span><span class="fastuooc-auto-player-theme-value"></span>',
         '</button>',
@@ -966,6 +1111,10 @@
           const collapsed = box.classList.toggle('is-collapsed');
           control.setAttribute('title', collapsed ? '展开控制面板' : '折叠控制面板');
           control.setAttribute('aria-label', collapsed ? '展开控制面板' : '折叠控制面板');
+          return;
+        }
+        if (action === 'export') {
+          exportQuiz();
           return;
         }
         if (action === 'enabled') state.config.enabled = !state.config.enabled;
