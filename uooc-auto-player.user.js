@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.5.0
+// @version      0.6.1
 // @description  自动控制UOOC视频播放，导出测验题目，并提供仅供参考的AI选项分析。
 // @author       Liunian06
 // @match        *://www.uooc.net.cn/home/learn/*
@@ -38,13 +38,7 @@
     aiModel: '',
     aiTimeout: 45000,
   });
-  const AI_MAX_CONCURRENCY = 20;
-  const AI_SYSTEM_PROMPT = [
-    '你是严谨的选择题分析助手。',
-    '请独立判断题目最可能的正确选项。',
-    '最终回复必须且只能包含一个候选选项标签，例如A、B、C或D。',
-    '不要输出解释、标点、前后缀、Markdown或多个选项。',
-  ].join('');
+  const AI_MAX_CONCURRENCY = 10;
 
   const state = {
     config: loadConfig(),
@@ -62,6 +56,7 @@
     patchedVideoService: null,
     unitSourcePromises: new WeakMap(),
     aiQueue: { active: 0, pending: [] },
+    aiResults: new WeakMap(),
     aiRunning: false,
   };
 
@@ -167,6 +162,15 @@
       .replace(/\|/g, '\\|');
   }
 
+  function normalizeQuizType(rawType, container, options) {
+    const text = String(rawType || '').trim();
+    const hasCheckbox = !!container.querySelector('input[type="checkbox"], .checkbox, [class*="checkbox"]');
+    const isMultiple = /多选|多项|不定项|multiple|checkbox/i.test(text) || hasCheckbox;
+    if (isMultiple) return { label: text || '多选题', multiple: true };
+    if (options.length && /判断|true\s*\/\s*false|true\s*or\s*false/i.test(text)) return { label: text || '判断题', multiple: false };
+    return { label: text || (options.length ? '单选题' : '主观题'), multiple: false };
+  }
+
   function extractQuizQuestionsFromDocument(doc) {
     const containers = Array.from(doc.querySelectorAll('.queContainer'));
     return containers.map((container, index) => {
@@ -182,9 +186,12 @@
           text: textFromElement(label.querySelector('.ti-a-c') || label),
         };
       }).filter((option) => option.text);
+      const rawType = typeNode ? textFromElement(typeNode).replace(/\s*\(共[\s\S]*$/, '').trim() : '';
+      const quizType = normalizeQuizType(rawType, container, options);
       return {
         number,
-        type: typeNode ? textFromElement(typeNode).replace(/\s*\(共[\s\S]*$/, '').trim() : '未分类',
+        type: quizType.label,
+        isMultiple: quizType.multiple,
         question: textFromElement(container.querySelector('.ti-q-c')),
         options,
         score: textFromElement(container.querySelector('.scores')),
@@ -270,9 +277,9 @@
     return raw + '/v1/chat/completions';
   }
 
-  function enqueueAI(task) {
+  function enqueueAI(task, onStart) {
     return new Promise((resolve, reject) => {
-      state.aiQueue.pending.push({ task, resolve, reject });
+      state.aiQueue.pending.push({ task, onStart, resolve, reject });
       pumpAIQueue();
     });
   }
@@ -282,7 +289,10 @@
       const item = state.aiQueue.pending.shift();
       state.aiQueue.active += 1;
       Promise.resolve()
-        .then(item.task)
+        .then(() => {
+          if (typeof item.onStart === 'function') item.onStart();
+          return item.task();
+        })
         .then(item.resolve, item.reject)
         .finally(() => {
           state.aiQueue.active -= 1;
@@ -291,7 +301,7 @@
     }
   }
 
-  function requestAICompletion(messages) {
+  function requestAICompletion(messages, onStart) {
     const endpoint = getAIEndpoint();
     if (!endpoint) return Promise.reject(new Error('未配置AI接口地址'));
     if (!state.config.aiApiKey) return Promise.reject(new Error('未配置AI API Key'));
@@ -300,7 +310,7 @@
       model: state.config.aiModel,
       messages,
       temperature: 0.2,
-      max_tokens: 8,
+      max_tokens: 50,
     });
     return enqueueAI(() => new Promise((resolve, reject) => {
       const timeout = Math.max(5000, Number(state.config.aiTimeout) || 45000);
@@ -345,14 +355,20 @@
         onerror: () => finish(reject, new Error('AI接口网络请求失败')),
         ontimeout: () => finish(reject, new Error('AI请求超时')),
       });
-    }));
+    }), onStart);
   }
 
   function buildAIQuestionPrompt(item) {
     const options = item.options.map((option) => option.label + '. ' + option.text).join('\n');
+    const typeLabel = item.isMultiple ? '多选题' : '单选题';
     return [
-      '请分析下面这道选择题，仅返回最可能正确的一个选项字母。',
-      '只允许返回一个大写字母，不要解释，不要输出标点，不要输出多个选项。',
+      '你是严谨的选择题分析助手。请独立判断下面题目的最可能正确答案。',
+      '先判断知识类型：数学、物理、化学、生物等需要推导或计算的题目，请直接进行严谨分析；历史、地理、政治、经济、法律、学校信息、机构信息、时事和其他事实性题目，如果当前模型或接口实际提供联网搜索/浏览工具，必须先调用该工具核验关键事实。',
+      '只有在确实调用了可用的联网搜索工具后，才可以声称完成了搜索；如果接口没有搜索工具，不要伪装已经搜索过，并根据已有知识谨慎判断。无法可靠判断时只输出“无法确定”，脚本会将其视为无效回答。',
+      '题型：' + typeLabel,
+      item.isMultiple
+        ? '输出规则：这是多选题，只输出所有最可能正确的选项标签，按题目顺序用英文逗号分隔，例如A,C。不要输出解释、标点前缀、Markdown或其他文字。'
+        : '输出规则：这是单选题，只输出一个最可能正确的选项标签，例如A。不要输出解释、标点前缀、Markdown或多个选项。',
       '',
       '题目：',
       item.question,
@@ -362,48 +378,72 @@
     ].join('\n');
   }
 
-  function normalizeAIOption(answer, item) {
+  function normalizeAIOptions(answer, item) {
     const valid = new Set(item.options.map((option) => option.label.toUpperCase()));
-    const match = String(answer || '').toUpperCase().match(/\b([A-Z])\b/);
-    return match && valid.has(match[1]) ? match[1] : '';
+    const text = String(answer || '').toUpperCase().trim();
+    if (!text || /无法确定|不确定|无法判断/.test(text)) return [];
+    const explicit = text.match(/\b[A-Z]\b/g) || [];
+    let labels = explicit.filter((label) => valid.has(label));
+    if (item.isMultiple) {
+      const compact = text.replace(/[\s,，、/|+和及以及与&;；:：()[\]{}"'`。.!?？]/g, '');
+      if (compact && compact.length <= item.options.length && Array.from(compact).every((label) => valid.has(label))) {
+        labels = Array.from(compact);
+      }
+    }
+    labels = Array.from(new Set(labels));
+    if (!item.isMultiple) labels = labels.slice(0, 1);
+    return item.options.map((option) => option.label.toUpperCase()).filter((label) => labels.includes(label));
   }
 
-  function countAIVotes(answers) {
+  function countAIVotes(answers, item) {
     const counts = {};
-    answers.filter(Boolean).forEach((answer) => { counts[answer] = (counts[answer] || 0) + 1; });
+    answers.filter((answer) => Array.isArray(answer) && answer.length).forEach((answer) => {
+      const key = answer.join(',');
+      counts[key] = (counts[key] || 0) + 1;
+    });
     const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-    if (!entries.length) return { option: '', votes: 0, total: answers.length, tied: false };
+    if (!entries.length) return { options: [], option: '', votes: 0, total: answers.length, tied: false };
     const tied = entries.length > 1 && entries[0][1] === entries[1][1];
-    return { option: tied ? '' : entries[0][0], votes: entries[0][1], total: answers.length, tied };
+    const options = tied ? [] : entries[0][0].split(',');
+    return {
+      options,
+      option: options.join('、'),
+      votes: entries[0][1],
+      total: answers.length,
+      tied,
+    };
   }
 
   async function analyzeQuizQuestion(item) {
-    const messages = [
-      { role: 'system', content: AI_SYSTEM_PROMPT },
-      { role: 'user', content: buildAIQuestionPrompt(item) },
-    ];
-    const firstRound = await Promise.all([1, 2, 3].map(() => requestAICompletion(messages).catch((error) => ({ error }))));
-    let answers = firstRound.map((result) => result && result.error ? '' : normalizeAIOption(result, item));
-    const firstVote = countAIVotes(answers);
-    if (firstVote.option || firstVote.tied) {
-      if (!firstVote.tied && firstVote.votes === 3) return firstVote;
-    }
-    const extraRound = await Promise.all([1, 2].map(() => requestAICompletion(messages).catch((error) => ({ error }))));
-    answers = answers.concat(extraRound.map((result) => result && result.error ? '' : normalizeAIOption(result, item)));
-    return countAIVotes(answers);
+    const messages = [{ role: 'user', content: buildAIQuestionPrompt(item) }];
+    let started = false;
+    const markStarted = () => {
+      if (started) return;
+      started = true;
+      renderAIAnalyzing(item.element);
+    };
+    const firstRound = await Promise.all([1, 2, 3].map(() => requestAICompletion(messages, markStarted).catch((error) => ({ error }))));
+    let answers = firstRound.map((result) => result && result.error ? [] : normalizeAIOptions(result, item));
+    const firstVote = countAIVotes(answers, item);
+    if (!firstVote.tied && firstVote.options.length && firstVote.votes === 3) return firstVote;
+    const extraRound = await Promise.all([1, 2].map(() => requestAICompletion(messages, markStarted).catch((error) => ({ error }))));
+    answers = answers.concat(extraRound.map((result) => result && result.error ? [] : normalizeAIOptions(result, item)));
+    return countAIVotes(answers, item);
   }
 
   function ensureAIStyles(doc) {
     if (!doc || doc.getElementById('fastuooc-ai-reference-style')) return;
     const style = doc.createElement('style');
     style.id = 'fastuooc-ai-reference-style';
-    style.textContent = '.fastuooc-ai-reference{display:inline-flex;align-items:center;gap:5px;margin:0 0 8px 8px;padding:3px 8px;border:1px solid rgba(37,99,235,.25);border-radius:999px;background:rgba(37,99,235,.08);color:#2563eb;font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.fastuooc-ai-reference.is-uncertain{border-color:rgba(100,116,139,.25);background:rgba(100,116,139,.08);color:#64748b}.fastuooc-ai-reference.is-loading{color:#64748b;animation:fastuooc-ai-pulse 1.1s ease-in-out infinite}@keyframes fastuooc-ai-pulse{50%{opacity:.45}}';
+    style.textContent = '.fastuooc-ai-reference{display:inline-flex;align-items:center;gap:5px;margin:0 0 8px 8px;padding:3px 8px;border:1px solid rgba(37,99,235,.25);border-radius:999px;background:rgba(37,99,235,.08);color:#2563eb;font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.fastuooc-ai-reference.is-uncertain{border-color:rgba(100,116,139,.25);background:rgba(100,116,139,.08);color:#64748b}.fastuooc-ai-reference.is-waiting{border-color:rgba(148,163,184,.24);background:rgba(148,163,184,.08);color:#94a3b8}.fastuooc-ai-reference.is-loading{color:#2563eb;animation:fastuooc-ai-pulse 1.1s ease-in-out infinite}@keyframes fastuooc-ai-pulse{50%{opacity:.45}}';
     (doc.head || doc.documentElement).appendChild(style);
   }
 
   function renderAIReference(container, result) {
     const doc = container.ownerDocument;
     ensureAIStyles(doc);
+    const normalized = Object.assign({ options: [], option: '', votes: 0, total: 0, tied: false }, result);
+    state.aiResults.set(container, normalized);
     let badge = container.querySelector('.fastuooc-ai-reference');
     if (!badge) {
       badge = doc.createElement('span');
@@ -412,12 +452,12 @@
       if (questionNode && questionNode.parentNode) questionNode.parentNode.appendChild(badge);
       else container.insertBefore(badge, container.firstChild);
     }
-    badge.classList.toggle('is-uncertain', !result.option);
-    badge.classList.remove('is-loading');
-    badge.textContent = result.message || (result.option ? 'AI参考：' + result.option + '（' + result.votes + '/' + result.total + '）' : 'AI参考：无法确定（票数并列或无有效回答）');
+    badge.classList.toggle('is-uncertain', !normalized.options.length);
+    badge.classList.remove('is-waiting', 'is-loading');
+    badge.textContent = normalized.message || (normalized.options.length ? 'AI参考：' + normalized.options.join('、') + '（' + normalized.votes + '/' + normalized.total + '）' : 'AI参考：无法确定（票数并列或无有效回答）');
   }
 
-  function renderAILoading(container) {
+  function renderAIStatus(container, message, className) {
     const doc = container.ownerDocument;
     ensureAIStyles(doc);
     let badge = container.querySelector('.fastuooc-ai-reference');
@@ -428,12 +468,21 @@
       if (questionNode && questionNode.parentNode) questionNode.parentNode.appendChild(badge);
       else container.insertBefore(badge, container.firstChild);
     }
-    badge.classList.remove('is-uncertain');
-    badge.classList.add('is-loading');
-    badge.textContent = 'AI参考：分析中…';
+    badge.classList.remove('is-uncertain', 'is-waiting', 'is-loading');
+    if (className) badge.classList.add(className);
+    badge.textContent = message;
   }
 
-  async function requestQuizAIReference() {
+  function renderAIWaiting(container) {
+    state.aiResults.delete(container);
+    renderAIStatus(container, 'AI参考：等待分析中…', 'is-waiting');
+  }
+
+  function renderAIAnalyzing(container) {
+    renderAIStatus(container, 'AI参考：分析中…', 'is-loading');
+  }
+
+  async function requestQuizAIReference(mode = 'all') {
     const result = findQuizQuestions();
     if (!result) {
       notify('当前页面未找到可分析的题目');
@@ -444,14 +493,26 @@
       openAISettings();
       return;
     }
-    const questions = result.questions.filter((item) => item.options.length > 0);
-    questions.forEach((item) => renderAILoading(item.element));
-    result.questions.filter((item) => !item.options.length).forEach((item) => renderAIReference(item.element, { option: '', votes: 0, total: 0, tied: false, message: '主观题不支持选项参考' }));
+    const selectable = result.questions.filter((item) => item.options.length > 0);
+    const questions = mode === 'uncertain'
+      ? selectable.filter((item) => {
+        const cached = state.aiResults.get(item.element);
+        return cached && !cached.options.length;
+      })
+      : selectable;
+    if (mode === 'all') {
+      questions.forEach((item) => renderAIWaiting(item.element));
+      result.questions
+        .filter((item) => !item.options.length)
+        .forEach((item) => renderAIReference(item.element, { options: [], votes: 0, total: 0, tied: false, message: '主观题不支持选项参考' }));
+    } else {
+      questions.forEach((item) => renderAIWaiting(item.element));
+    }
     if (!questions.length) {
-      notify('当前页面没有可分析的选择题');
+      notify(mode === 'uncertain' ? '当前没有需要重试的无法确定题目' : '当前页面没有可分析的选择题');
       return;
     }
-    notify('正在分析' + questions.length + '道选择题，最多20路并发');
+    notify((mode === 'uncertain' ? '正在重试' : '正在分析') + questions.length + '道选择题，最多10路并发');
     let completed = 0;
     await Promise.all(questions.map(async (item) => {
       try {
@@ -459,12 +520,55 @@
         renderAIReference(item.element, vote);
       } catch (error) {
         log('AI题目分析失败', item.number, error);
-        renderAIReference(item.element, { option: '', votes: 0, total: 0, tied: false });
+        renderAIReference(item.element, { options: [], votes: 0, total: 0, tied: false });
       } finally {
         completed += 1;
         if (completed === questions.length) notify('AI参考分析完成，共' + questions.length + '道选择题');
       }
     }));
+  }
+
+  function ensureAIChoiceStyles() {
+    if (document.getElementById('fastuooc-ai-reference-choice-style')) return;
+    const style = document.createElement('style');
+    style.id = 'fastuooc-ai-reference-choice-style';
+    style.textContent = '#fastuooc-ai-reference-choice{position:fixed;inset:0;z-index:2147483647;font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}#fastuooc-ai-reference-choice .fastuooc-ai-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.38);backdrop-filter:blur(5px)}#fastuooc-ai-reference-choice .fastuooc-ai-dialog{position:absolute;top:50%;left:50%;width:min(420px,calc(100vw - 28px));transform:translate(-50%,-50%);padding:18px;border:1px solid rgba(148,163,184,.28);border-radius:16px;background:#fff;color:#172033;box-shadow:0 24px 70px rgba(15,23,42,.28)}#fastuooc-ai-reference-choice .fastuooc-ai-dialog-head{display:flex;align-items:center;justify-content:space-between;font-size:16px}#fastuooc-ai-reference-choice .fastuooc-ai-dialog-head button{width:30px;height:30px;border:0;border-radius:50%;background:#f1f5f9;color:#64748b;font-size:20px;line-height:1;cursor:pointer}#fastuooc-ai-reference-choice .fastuooc-ai-help{margin:8px 0 12px;color:#64748b}#fastuooc-ai-reference-choice .fastuooc-ai-reference-count{margin:0 0 16px;padding:10px 12px;border-radius:10px;background:#f1f5f9;color:#475569}#fastuooc-ai-reference-choice .fastuooc-ai-reference-actions{display:flex;justify-content:flex-end;gap:8px}#fastuooc-ai-reference-choice .fastuooc-ai-reference-actions button{height:36px;padding:0 13px;border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;color:#334155;font-weight:600;cursor:pointer}#fastuooc-ai-reference-choice .fastuooc-ai-reference-actions button.is-primary{border-color:#2563eb;background:#2563eb;color:#fff}@media(prefers-color-scheme:dark){#fastuooc-ai-reference-choice .fastuooc-ai-dialog{background:#121824;color:#e7edf7}#fastuooc-ai-reference-choice .fastuooc-ai-dialog-head button{background:#334155;color:#cbd5e1}#fastuooc-ai-reference-choice .fastuooc-ai-help{color:#94a3b8}#fastuooc-ai-reference-choice .fastuooc-ai-reference-count{background:#1e293b;color:#cbd5e1}#fastuooc-ai-reference-choice .fastuooc-ai-reference-actions button{border-color:#475569;background:#1e293b;color:#e2e8f0}}';
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function openAIReferenceModeDialog(questionCount, uncertainCount) {
+    ensureAIChoiceStyles();
+    return new Promise((resolve) => {
+      const existing = document.getElementById('fastuooc-ai-reference-choice');
+      if (existing) existing.remove();
+      const modal = document.createElement('div');
+      modal.id = 'fastuooc-ai-reference-choice';
+      modal.innerHTML = [
+        '<div class="fastuooc-ai-backdrop" data-reference-action="cancel"></div>',
+        '<section class="fastuooc-ai-dialog fastuooc-ai-reference-dialog" role="dialog" aria-modal="true" aria-labelledby="fastuooc-ai-reference-choice-title">',
+        '<div class="fastuooc-ai-dialog-head"><strong id="fastuooc-ai-reference-choice-title">已有AI参考结果</strong><button type="button" data-reference-action="cancel" aria-label="关闭提示">×</button></div>',
+        '<p class="fastuooc-ai-help">当前页面已有' + questionCount + '道题生成过参考结果。请选择本次处理范围。</p>',
+        '<div class="fastuooc-ai-reference-count">当前无法确定：' + uncertainCount + '道</div>',
+        '<div class="fastuooc-ai-reference-actions">',
+        '<button type="button" data-reference-action="uncertain">仅重试无法确定</button>',
+        '<button type="button" class="is-primary" data-reference-action="all">覆盖全部</button>',
+        '</div>',
+        '</section>',
+      ].join('');
+      const finish = (mode) => {
+        modal.remove();
+        resolve(mode);
+      };
+      modal.addEventListener('click', (event) => {
+        const actionNode = event.target.closest('[data-reference-action]');
+        if (!actionNode) return;
+        const action = actionNode.dataset.referenceAction;
+        if (action === 'all') finish('all');
+        else if (action === 'uncertain') finish('uncertain');
+        else finish('cancel');
+      });
+      (document.body || document.documentElement).appendChild(modal);
+    });
   }
 
   function openAISettings() {
@@ -518,7 +622,7 @@
         state.config.aiTimeout = Math.min(120000, Math.max(5000, Number(modal.querySelector('[data-ai-field="timeout"]').value) || 45000));
         status('正在测试接口…');
         try {
-          await requestAICompletion([{ role: 'system', content: '只回复OK。' }, { role: 'user', content: '连通性测试，只回复OK。' }]);
+          await requestAICompletion([{ role: 'user', content: '这是接口连通性测试。请只回复OK，不要输出其他内容。' }]);
           status('接口连接成功');
         } catch (error) {
           status('接口测试失败：' + error.message);
@@ -1434,10 +1538,30 @@
           if (state.aiRunning) return;
           state.aiRunning = true;
           update();
-          requestQuizAIReference().finally(() => {
-            state.aiRunning = false;
-            update();
-          });
+          (async () => {
+            try {
+              const quiz = findQuizQuestions();
+              if (!quiz) {
+                notify('当前页面未找到可分析的题目');
+                return;
+              }
+              const selectable = quiz.questions.filter((item) => item.options.length > 0);
+              const existing = selectable.filter((item) => state.aiResults.has(item.element) || item.element.querySelector('.fastuooc-ai-reference:not(.is-loading)'));
+              let mode = 'all';
+              if (existing.length) {
+                const uncertain = existing.filter((item) => {
+                  const cached = state.aiResults.get(item.element);
+                  return !cached || !cached.options || !cached.options.length;
+                });
+                mode = await openAIReferenceModeDialog(existing.length, uncertain.length);
+                if (mode === 'cancel') return;
+              }
+              await requestQuizAIReference(mode);
+            } finally {
+              state.aiRunning = false;
+              update();
+            }
+          })();
           return;
         }
         if (action === 'enabled') state.config.enabled = !state.config.enabled;
