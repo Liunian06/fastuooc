@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.4.0
-// @description  自动控制UOOC视频播放，并支持按题拆分导出当前测验的题目与选项。
+// @version      0.5.0
+// @description  自动控制UOOC视频播放，导出测验题目，并提供仅供参考的AI选项分析。
 // @author       Liunian06
 // @match        *://www.uooc.net.cn/home/learn/*
 // @match        *://*.uooc.net.cn/home/learn/*
@@ -14,7 +14,10 @@
 // @match        *://*.uooc.online/exam/*
 // @run-at       document-start
 // @noframes
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      *
 // ==/UserScript==
 
 (function () {
@@ -30,7 +33,18 @@
     keepBackground: true,
     theme: 'system',
     nextDelay: 1200,
+    aiBaseUrl: '',
+    aiApiKey: '',
+    aiModel: '',
+    aiTimeout: 45000,
   });
+  const AI_MAX_CONCURRENCY = 20;
+  const AI_SYSTEM_PROMPT = [
+    '你是严谨的选择题分析助手。',
+    '请独立判断题目最可能的正确选项。',
+    '最终回复必须且只能包含一个候选选项标签，例如A、B、C或D。',
+    '不要输出解释、标点、前后缀、Markdown或多个选项。',
+  ].join('');
 
   const state = {
     config: loadConfig(),
@@ -47,19 +61,37 @@
     backgroundGuardTimer: null,
     patchedVideoService: null,
     unitSourcePromises: new WeakMap(),
+    aiQueue: { active: 0, pending: [] },
+    aiRunning: false,
   };
 
   function loadConfig() {
     try {
       const stored = JSON.parse(localStorage.getItem(CONFIG_KEY) || '{}');
-      return Object.assign({}, DEFAULT_CONFIG, stored);
+      const legacyApiKey = stored.aiApiKey || '';
+      delete stored.aiApiKey;
+      if (legacyApiKey) localStorage.setItem(CONFIG_KEY, JSON.stringify(stored));
+      const config = Object.assign({}, DEFAULT_CONFIG, stored);
+      try {
+        config.aiApiKey = (typeof GM_getValue === 'function' && GM_getValue('fastuooc:ai-api-key', '')) || legacyApiKey;
+      } catch (_) {
+        config.aiApiKey = legacyApiKey;
+      }
+      return config;
     } catch (_) {
-      return Object.assign({}, DEFAULT_CONFIG);
+      return Object.assign({}, DEFAULT_CONFIG, { aiApiKey: '' });
     }
   }
 
   function saveConfig() {
-    localStorage.setItem(CONFIG_KEY, JSON.stringify(state.config));
+    const stored = Object.assign({}, state.config);
+    delete stored.aiApiKey;
+    localStorage.setItem(CONFIG_KEY, JSON.stringify(stored));
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue('fastuooc:ai-api-key', state.config.aiApiKey || '');
+    } catch (_) {
+      log('保存AI API Key失败');
+    }
   }
 
   function enforceMasterConfig() {
@@ -157,6 +189,7 @@
         options,
         score: textFromElement(container.querySelector('.scores')),
         id: (container.querySelector('.index') || {}).id || (container.querySelector('input[name]') || {}).name || '',
+        element: container,
       };
     }).filter((item) => item.question);
   }
@@ -227,6 +260,271 @@
       .slice(0, 80) || 'uooc-quiz';
     downloadText(safeTitle + '.md', formatQuizMarkdown(result), 'text/markdown;charset=utf-8');
     notify('已导出' + result.questions.length + '道题目');
+  }
+
+  function getAIEndpoint() {
+    const raw = String(state.config.aiBaseUrl || '').trim().replace(/\/+$/, '');
+    if (!raw) return '';
+    if (/\/chat\/completions$/i.test(raw)) return raw;
+    if (/\/v1$/i.test(raw)) return raw + '/chat/completions';
+    return raw + '/v1/chat/completions';
+  }
+
+  function enqueueAI(task) {
+    return new Promise((resolve, reject) => {
+      state.aiQueue.pending.push({ task, resolve, reject });
+      pumpAIQueue();
+    });
+  }
+
+  function pumpAIQueue() {
+    while (state.aiQueue.active < AI_MAX_CONCURRENCY && state.aiQueue.pending.length) {
+      const item = state.aiQueue.pending.shift();
+      state.aiQueue.active += 1;
+      Promise.resolve()
+        .then(item.task)
+        .then(item.resolve, item.reject)
+        .finally(() => {
+          state.aiQueue.active -= 1;
+          pumpAIQueue();
+        });
+    }
+  }
+
+  function requestAICompletion(messages) {
+    const endpoint = getAIEndpoint();
+    if (!endpoint) return Promise.reject(new Error('未配置AI接口地址'));
+    if (!state.config.aiApiKey) return Promise.reject(new Error('未配置AI API Key'));
+    if (!state.config.aiModel) return Promise.reject(new Error('未配置AI模型名称'));
+    const body = JSON.stringify({
+      model: state.config.aiModel,
+      messages,
+      temperature: 0.2,
+      max_tokens: 8,
+    });
+    return enqueueAI(() => new Promise((resolve, reject) => {
+      const timeout = Math.max(5000, Number(state.config.aiTimeout) || 45000);
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback(value);
+      };
+      const timer = setTimeout(() => finish(reject, new Error('AI请求超时')), timeout);
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        finish(reject, new Error('当前脚本管理器不支持GM_xmlhttpRequest'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: endpoint,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + state.config.aiApiKey,
+        },
+        data: body,
+        timeout,
+        onload: (response) => {
+          if (response.status < 200 || response.status >= 300) {
+            finish(reject, new Error('AI接口返回HTTP ' + response.status));
+            return;
+          }
+          try {
+            const data = JSON.parse(response.responseText || '{}');
+            const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+            const text = Array.isArray(content)
+              ? content.map((part) => typeof part === 'string' ? part : (part && part.text) || '').join('')
+              : String(content || '');
+            if (!text.trim()) throw new Error('AI接口响应中没有choices[0].message.content');
+            finish(resolve, text.trim());
+          } catch (error) {
+            finish(reject, error);
+          }
+        },
+        onerror: () => finish(reject, new Error('AI接口网络请求失败')),
+        ontimeout: () => finish(reject, new Error('AI请求超时')),
+      });
+    }));
+  }
+
+  function buildAIQuestionPrompt(item) {
+    const options = item.options.map((option) => option.label + '. ' + option.text).join('\n');
+    return [
+      '请分析下面这道选择题，仅返回最可能正确的一个选项字母。',
+      '只允许返回一个大写字母，不要解释，不要输出标点，不要输出多个选项。',
+      '',
+      '题目：',
+      item.question,
+      '',
+      '选项：',
+      options,
+    ].join('\n');
+  }
+
+  function normalizeAIOption(answer, item) {
+    const valid = new Set(item.options.map((option) => option.label.toUpperCase()));
+    const match = String(answer || '').toUpperCase().match(/\b([A-Z])\b/);
+    return match && valid.has(match[1]) ? match[1] : '';
+  }
+
+  function countAIVotes(answers) {
+    const counts = {};
+    answers.filter(Boolean).forEach((answer) => { counts[answer] = (counts[answer] || 0) + 1; });
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) return { option: '', votes: 0, total: answers.length, tied: false };
+    const tied = entries.length > 1 && entries[0][1] === entries[1][1];
+    return { option: tied ? '' : entries[0][0], votes: entries[0][1], total: answers.length, tied };
+  }
+
+  async function analyzeQuizQuestion(item) {
+    const messages = [
+      { role: 'system', content: AI_SYSTEM_PROMPT },
+      { role: 'user', content: buildAIQuestionPrompt(item) },
+    ];
+    const firstRound = await Promise.all([1, 2, 3].map(() => requestAICompletion(messages).catch((error) => ({ error }))));
+    let answers = firstRound.map((result) => result && result.error ? '' : normalizeAIOption(result, item));
+    const firstVote = countAIVotes(answers);
+    if (firstVote.option || firstVote.tied) {
+      if (!firstVote.tied && firstVote.votes === 3) return firstVote;
+    }
+    const extraRound = await Promise.all([1, 2].map(() => requestAICompletion(messages).catch((error) => ({ error }))));
+    answers = answers.concat(extraRound.map((result) => result && result.error ? '' : normalizeAIOption(result, item)));
+    return countAIVotes(answers);
+  }
+
+  function ensureAIStyles(doc) {
+    if (!doc || doc.getElementById('fastuooc-ai-reference-style')) return;
+    const style = doc.createElement('style');
+    style.id = 'fastuooc-ai-reference-style';
+    style.textContent = '.fastuooc-ai-reference{display:inline-flex;align-items:center;gap:5px;margin:0 0 8px 8px;padding:3px 8px;border:1px solid rgba(37,99,235,.25);border-radius:999px;background:rgba(37,99,235,.08);color:#2563eb;font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.fastuooc-ai-reference.is-uncertain{border-color:rgba(100,116,139,.25);background:rgba(100,116,139,.08);color:#64748b}.fastuooc-ai-reference.is-loading{color:#64748b;animation:fastuooc-ai-pulse 1.1s ease-in-out infinite}@keyframes fastuooc-ai-pulse{50%{opacity:.45}}';
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+
+  function renderAIReference(container, result) {
+    const doc = container.ownerDocument;
+    ensureAIStyles(doc);
+    let badge = container.querySelector('.fastuooc-ai-reference');
+    if (!badge) {
+      badge = doc.createElement('span');
+      badge.className = 'fastuooc-ai-reference';
+      const questionNode = container.querySelector('.ti-q-c') || container.firstElementChild;
+      if (questionNode && questionNode.parentNode) questionNode.parentNode.appendChild(badge);
+      else container.insertBefore(badge, container.firstChild);
+    }
+    badge.classList.toggle('is-uncertain', !result.option);
+    badge.classList.remove('is-loading');
+    badge.textContent = result.message || (result.option ? 'AI参考：' + result.option + '（' + result.votes + '/' + result.total + '）' : 'AI参考：无法确定（票数并列或无有效回答）');
+  }
+
+  function renderAILoading(container) {
+    const doc = container.ownerDocument;
+    ensureAIStyles(doc);
+    let badge = container.querySelector('.fastuooc-ai-reference');
+    if (!badge) {
+      badge = doc.createElement('span');
+      badge.className = 'fastuooc-ai-reference';
+      const questionNode = container.querySelector('.ti-q-c') || container.firstElementChild;
+      if (questionNode && questionNode.parentNode) questionNode.parentNode.appendChild(badge);
+      else container.insertBefore(badge, container.firstChild);
+    }
+    badge.classList.remove('is-uncertain');
+    badge.classList.add('is-loading');
+    badge.textContent = 'AI参考：分析中…';
+  }
+
+  async function requestQuizAIReference() {
+    const result = findQuizQuestions();
+    if (!result) {
+      notify('当前页面未找到可分析的题目');
+      return;
+    }
+    if (!getAIEndpoint() || !state.config.aiApiKey || !state.config.aiModel) {
+      notify('请先在AI设置中填写接口地址、Key和模型');
+      openAISettings();
+      return;
+    }
+    const questions = result.questions.filter((item) => item.options.length > 0);
+    questions.forEach((item) => renderAILoading(item.element));
+    result.questions.filter((item) => !item.options.length).forEach((item) => renderAIReference(item.element, { option: '', votes: 0, total: 0, tied: false, message: '主观题不支持选项参考' }));
+    if (!questions.length) {
+      notify('当前页面没有可分析的选择题');
+      return;
+    }
+    notify('正在分析' + questions.length + '道选择题，最多20路并发');
+    let completed = 0;
+    await Promise.all(questions.map(async (item) => {
+      try {
+        const vote = await analyzeQuizQuestion(item);
+        renderAIReference(item.element, vote);
+      } catch (error) {
+        log('AI题目分析失败', item.number, error);
+        renderAIReference(item.element, { option: '', votes: 0, total: 0, tied: false });
+      } finally {
+        completed += 1;
+        if (completed === questions.length) notify('AI参考分析完成，共' + questions.length + '道选择题');
+      }
+    }));
+  }
+
+  function openAISettings() {
+    const existing = document.getElementById('fastuooc-ai-settings');
+    if (existing) {
+      existing.hidden = false;
+      return;
+    }
+    const modal = document.createElement('div');
+    modal.id = 'fastuooc-ai-settings';
+    modal.innerHTML = [
+      '<div class="fastuooc-ai-backdrop" data-ai-action="close"></div>',
+      '<section class="fastuooc-ai-dialog" role="dialog" aria-modal="true" aria-labelledby="fastuooc-ai-settings-title">',
+      '<div class="fastuooc-ai-dialog-head"><strong id="fastuooc-ai-settings-title">AI参考设置</strong><button type="button" data-ai-action="close" aria-label="关闭设置">×</button></div>',
+      '<p class="fastuooc-ai-help">仅用于生成参考选项，不会自动勾选或提交测验。</p>',
+      '<label>接口地址<input data-ai-field="baseUrl" type="url" placeholder="https://api.example.com/v1"></label>',
+      '<label>API Key<input data-ai-field="apiKey" type="password" placeholder="sk-..."></label>',
+      '<label>模型名称<input data-ai-field="model" type="text" placeholder="gpt-4o-mini"></label>',
+      '<label>超时时间（毫秒）<input data-ai-field="timeout" type="number" min="5000" max="120000" step="1000"></label>',
+      '<div class="fastuooc-ai-dialog-actions"><button type="button" data-ai-action="test">测试接口</button><button type="button" class="is-primary" data-ai-action="save">保存设置</button></div>',
+      '<div class="fastuooc-ai-dialog-status" data-ai-role="status" aria-live="polite"></div>',
+      '</section>',
+    ].join('');
+    const style = document.createElement('style');
+    style.id = 'fastuooc-ai-settings-style';
+    style.textContent = '#fastuooc-ai-settings{position:fixed;inset:0;z-index:2147483647;font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}#fastuooc-ai-settings[hidden]{display:none}.fastuooc-ai-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.38);backdrop-filter:blur(5px)}.fastuooc-ai-dialog{position:absolute;top:50%;left:50%;width:min(420px,calc(100vw - 28px));transform:translate(-50%,-50%);padding:18px;border:1px solid rgba(148,163,184,.28);border-radius:16px;background:#fff;color:#172033;box-shadow:0 24px 70px rgba(15,23,42,.28)}.fastuooc-ai-dialog-head{display:flex;align-items:center;justify-content:space-between;font-size:16px}.fastuooc-ai-dialog-head button{width:30px;height:30px;border:0;border-radius:50%;background:#f1f5f9;color:#64748b;font-size:20px;line-height:1;cursor:pointer}.fastuooc-ai-help{margin:8px 0 16px;color:#64748b}.fastuooc-ai-dialog label{display:flex;flex-direction:column;gap:6px;margin:12px 0;color:#334155;font-weight:600}.fastuooc-ai-dialog input{box-sizing:border-box;width:100%;height:38px;padding:0 10px;border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;color:#172033;font:13px inherit;outline:0}.fastuooc-ai-dialog input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}.fastuooc-ai-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.fastuooc-ai-dialog-actions button{height:36px;padding:0 13px;border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;color:#334155;font-weight:600;cursor:pointer}.fastuooc-ai-dialog-actions button.is-primary{border-color:#2563eb;background:#2563eb;color:#fff}.fastuooc-ai-dialog-status{min-height:20px;margin-top:10px;color:#64748b}@media(prefers-color-scheme:dark){.fastuooc-ai-dialog{background:#121824;color:#e7edf7}.fastuooc-ai-dialog-head button{background:#334155;color:#cbd5e1}.fastuooc-ai-help,.fastuooc-ai-dialog-status{color:#94a3b8}.fastuooc-ai-dialog label{color:#cbd5e1}.fastuooc-ai-dialog input{border-color:#475569;background:#1e293b;color:#e7edf7}.fastuooc-ai-dialog-actions button{border-color:#475569;background:#1e293b;color:#cbd5e1}}';
+    (document.head || document.documentElement).appendChild(style);
+    (document.body || document.documentElement).appendChild(modal);
+    modal.querySelector('[data-ai-field="baseUrl"]').value = state.config.aiBaseUrl || '';
+    modal.querySelector('[data-ai-field="apiKey"]').value = state.config.aiApiKey || '';
+    modal.querySelector('[data-ai-field="model"]').value = state.config.aiModel || '';
+    modal.querySelector('[data-ai-field="timeout"]').value = state.config.aiTimeout || 45000;
+    const status = (message) => { modal.querySelector('[data-ai-role="status"]').textContent = message; };
+    modal.addEventListener('click', async (event) => {
+      const action = event.target.closest('[data-ai-action]') && event.target.closest('[data-ai-action]').dataset.aiAction;
+      if (action === 'close') { modal.hidden = true; return; }
+      if (action === 'save') {
+        state.config.aiBaseUrl = modal.querySelector('[data-ai-field="baseUrl"]').value.trim();
+        state.config.aiApiKey = modal.querySelector('[data-ai-field="apiKey"]').value.trim();
+        state.config.aiModel = modal.querySelector('[data-ai-field="model"]').value.trim();
+        state.config.aiTimeout = Math.min(120000, Math.max(5000, Number(modal.querySelector('[data-ai-field="timeout"]').value) || 45000));
+        saveConfig();
+        status('设置已保存');
+        notify('AI参考设置已保存');
+        return;
+      }
+      if (action === 'test') {
+        state.config.aiBaseUrl = modal.querySelector('[data-ai-field="baseUrl"]').value.trim();
+        state.config.aiApiKey = modal.querySelector('[data-ai-field="apiKey"]').value.trim();
+        state.config.aiModel = modal.querySelector('[data-ai-field="model"]').value.trim();
+        state.config.aiTimeout = Math.min(120000, Math.max(5000, Number(modal.querySelector('[data-ai-field="timeout"]').value) || 45000));
+        status('正在测试接口…');
+        try {
+          await requestAICompletion([{ role: 'system', content: '只回复OK。' }, { role: 'user', content: '连通性测试，只回复OK。' }]);
+          status('接口连接成功');
+        } catch (error) {
+          status('接口测试失败：' + error.message);
+        }
+      }
+    });
   }
 
   function unique(values) {
@@ -1030,6 +1328,10 @@
       '.fastuooc-auto-player-export{display:flex!important;align-items:center;justify-content:center;gap:7px;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:center}',
       '.fastuooc-auto-player-export:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
       '.fastuooc-auto-player-export svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}',
+      '.fastuooc-auto-player-ai-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}',
+      '.fastuooc-auto-player-ai{display:flex!important;align-items:center;justify-content:center;width:100%!important;height:36px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 8px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important}',
+      '.fastuooc-auto-player-ai:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
+      '.fastuooc-auto-player-ai:disabled{opacity:.55!important;cursor:not-allowed!important}',
       '.fastuooc-auto-player-theme{display:flex!important;align-items:center;justify-content:space-between;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:left}',
       '.fastuooc-auto-player-theme:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
       '.fastuooc-auto-player-theme-value{color:var(--panel-muted);font-size:11px}',
@@ -1076,6 +1378,10 @@
         '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path></svg>',
         '<span>导出题目</span>',
         '</button>',
+        '<div class="fastuooc-auto-player-ai-row">',
+        '<button class="fastuooc-auto-player-ai" data-action="ai-analyze" title="获取AI参考选项，不会自动作答">AI参考</button>',
+        '<button class="fastuooc-auto-player-ai" data-action="ai-settings" title="配置OpenAI兼容接口">AI设置</button>',
+        '</div>',
         '<button class="fastuooc-auto-player-theme" data-action="theme" title="切换界面主题：跟随系统、浅色、深色" aria-label="切换界面主题">',
         '<span>界面主题</span><span class="fastuooc-auto-player-theme-value"></span>',
         '</button>',
@@ -1088,6 +1394,7 @@
         const mute = box.querySelector('[data-action="mute"]');
         const background = box.querySelector('[data-action="background"]');
         const theme = box.querySelector('[data-action="theme"]');
+        const aiAnalyze = box.querySelector('[data-action="ai-analyze"]');
         const masterEnabled = state.config.enabled;
         const themeMode = ['system', 'light', 'dark'].includes(state.config.theme) ? state.config.theme : 'system';
         const themeLabel = themeMode === 'system' ? '跟随系统' : themeMode === 'light' ? '浅色' : '深色';
@@ -1099,6 +1406,8 @@
           button.setAttribute('aria-pressed', String(isOn));
           button.setAttribute('aria-disabled', String(disabled));
         });
+        aiAnalyze.disabled = state.aiRunning;
+        aiAnalyze.textContent = state.aiRunning ? '分析中…' : 'AI参考';
         theme.querySelector('.fastuooc-auto-player-theme-value').textContent = themeLabel;
         theme.setAttribute('aria-label', `切换界面主题，当前为${themeLabel}`);
         box.querySelector('[data-role="state"]').textContent = masterEnabled ? `${state.config.speed}倍速 · 静音 · 后台播放 · ${themeLabel}` : `${state.config.speed}倍速 · ${state.config.autoNext ? '连播' : '不连播'} · ${state.config.muted ? '静音' : '有声'} · ${state.config.keepBackground ? '后台播放' : '前台播放'} · ${themeLabel}`;
@@ -1115,6 +1424,20 @@
         }
         if (action === 'export') {
           exportQuiz();
+          return;
+        }
+        if (action === 'ai-settings') {
+          openAISettings();
+          return;
+        }
+        if (action === 'ai-analyze') {
+          if (state.aiRunning) return;
+          state.aiRunning = true;
+          update();
+          requestQuizAIReference().finally(() => {
+            state.aiRunning = false;
+            update();
+          });
           return;
         }
         if (action === 'enabled') state.config.enabled = !state.config.enabled;
