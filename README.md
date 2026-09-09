@@ -8,7 +8,6 @@
     <a href="LICENSE">
       <img src="https://img.shields.io/badge/License-MIT-16A34A?style=flat-square" alt="MIT许可证">
     </a>
-    <img src="https://img.shields.io/badge/UI-新旧版本兼容-7C3AED?style=flat-square" alt="新旧版本兼容">
   </p>
 </div>
 
