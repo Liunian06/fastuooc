@@ -2,7 +2,7 @@
   <h1>Fast UOOC</h1>
   <p>让UOOC课程播放更顺畅，减少重复操作，把注意力留给学习本身。</p>
   <p>
-    <a href="https://raw.githubusercontent.com/Liunian06/fastuooc/main/uooc-auto-player.user.js">
+    <a href="https://greasyfork.org/zh-CN/scripts/595099-fast-uooc">
       <img src="https://img.shields.io/badge/Tampermonkey-一键安装-2563EB?style=flat-square" alt="一键安装">
     </a>
     <a href="LICENSE">
@@ -27,10 +27,10 @@ Fast UOOC是一款面向UOOC在线学习页面的Tampermonkey用户脚本，专�
 
 **一键安装**
 
-点击下面的链接，Tampermonkey会自动打开安装页面：
+先安装[Tampermonkey](https://www.tampermonkey.net/)，再打开下面的Greasy Fork页面，点击“安装此脚本”，并在Tampermonkey中确认安装：
 
 <p>
-  <a href="https://raw.githubusercontent.com/Liunian06/fastuooc/main/uooc-auto-player.user.js"><strong>安装Fast UOOC</strong></a>
+  <a href="https://greasyfork.org/zh-CN/scripts/595099-fast-uooc"><strong>安装Fast UOOC</strong></a>
 </p>
 
 **手动安装**

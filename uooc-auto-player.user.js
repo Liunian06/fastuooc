@@ -4,6 +4,7 @@
 // @version      0.6.1
 // @description  自动控制UOOC视频播放，导出测验题目，并提供仅供参考的AI选项分析。
 // @author       Liunian06
+// @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
 // @match        *://*.uooc.net.cn/home/learn/*
 // @match        *://*.uooconline.com/home/learn/*
