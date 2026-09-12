@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.6.1
+// @version      0.6.5
 // @description  自动控制UOOC视频播放，导出测验题目，并提供仅供参考的AI选项分析。
 // @author       Liunian06
 // @license      MIT
@@ -18,12 +18,16 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @connect      *
 // ==/UserScript==
 
 (function () {
   'use strict';
 
+  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const SCRIPT_VERSION = '0.6.5';
+  const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const DEFAULT_CONFIG = Object.freeze({
     enabled: true,
@@ -56,6 +60,7 @@
     backgroundGuardTimer: null,
     patchedVideoService: null,
     unitSourcePromises: new WeakMap(),
+    catalogRequestCount: 0,
     aiQueue: { active: 0, pending: [] },
     aiResults: new WeakMap(),
     aiRunning: false,
@@ -86,7 +91,7 @@
     try {
       if (typeof GM_setValue === 'function') GM_setValue('fastuooc:ai-api-key', state.config.aiApiKey || '');
     } catch (_) {
-      log('保存AI API Key失败');
+      logWarning('保存AI API Key失败');
     }
   }
 
@@ -99,8 +104,106 @@
     return changed;
   }
 
+  function writeLog(level, ...args) {
+    const normalizedLevel = String(level || 'info').toLowerCase();
+    const method = typeof console[normalizedLevel] === 'function' ? console[normalizedLevel] : console.log;
+    const levelLabel = '[' + normalizedLevel.toUpperCase() + ']';
+    method.call(console, LOG_PREFIX + levelLabel, new Date().toISOString(), ...args);
+  }
+
   function log(...args) {
-    console.debug('[UOOC自动播放]', ...args);
+    writeLog('info', ...args);
+  }
+
+  function debugLog(...args) {
+    writeLog('debug', ...args);
+  }
+
+  function logWarning(...args) {
+    writeLog('warn', ...args);
+  }
+
+  function logError(...args) {
+    writeLog('error', ...args);
+  }
+
+  function sanitizeUrlForLog(value) {
+    if (!value) return '';
+    try {
+      const url = new URL(String(value), location.href);
+      url.search = '';
+      url.hash = '';
+      return url.toString();
+    } catch (_) {
+      return String(value).split('?')[0].split('#')[0];
+    }
+  }
+
+  function getDiagnosticSnapshot() {
+    const video = state.video;
+    return {
+      timestamp: new Date().toISOString(),
+      version: SCRIPT_VERSION,
+      url: sanitizeUrlForLog(location.href),
+      route: getRouteParams(),
+      config: {
+        enabled: state.config.enabled,
+        autoPlay: state.config.autoPlay,
+        autoNext: state.config.autoNext,
+        speed: state.config.speed,
+        muted: state.config.muted,
+        keepBackground: state.config.keepBackground,
+        nextDelay: state.config.nextDelay,
+      },
+      runtime: {
+        angularAvailable: Boolean(pageWindow.angular),
+        angularInjectorAvailable: Boolean(getAngularInjector()),
+        videoJsAvailable: Boolean(pageWindow.videojs),
+        navigating: state.navigating,
+        nextRun: state.nextRun,
+        videoGeneration: state.videoGeneration,
+        intendedPlayback: state.intendedPlayback,
+        handledErrorCount: state.handledErrors.size,
+        catalogRequestCount: state.catalogRequestCount,
+        attemptedSources: Array.from(state.attemptedSources).map(sanitizeUrlForLog),
+      },
+      dom: {
+        videoCount: document.querySelectorAll('video').length,
+        chapterNodeCount: document.querySelectorAll('[ui-sref^="main.chapter("]').length,
+        sectionNodeCount: document.querySelectorAll('[ui-sref^="main.chapter.section("]').length,
+        sourceNodeCount: document.querySelectorAll('[ng-click*="goSource"]').length,
+      },
+      video: video ? {
+        currentSrc: sanitizeUrlForLog(video.currentSrc || video.src || ''),
+        currentTime: Number(video.currentTime) || 0,
+        duration: Number(video.duration) || 0,
+        paused: video.paused,
+        ended: video.ended,
+        readyState: video.readyState,
+        networkState: video.networkState,
+        playbackRate: video.playbackRate,
+        muted: video.muted,
+        error: video.error ? {
+          code: video.error.code,
+          message: video.error.message || '',
+        } : null,
+      } : null,
+    };
+  }
+
+  function installDebugApi() {
+    try {
+      pageWindow.fastuoocDebug = {
+        version: SCRIPT_VERSION,
+        snapshot() {
+          const snapshot = getDiagnosticSnapshot();
+          log('诊断快照', snapshot);
+          return snapshot;
+        },
+      };
+    } catch (error) {
+      logWarning('无法暴露fastuoocDebug诊断接口', error);
+    }
   }
 
   function notify(message, timeout = 2200) {
@@ -520,7 +623,7 @@
         const vote = await analyzeQuizQuestion(item);
         renderAIReference(item.element, vote);
       } catch (error) {
-        log('AI题目分析失败', item.number, error);
+        logError('AI题目分析失败', item.number, error);
         renderAIReference(item.element, { options: [], votes: 0, total: 0, tied: false });
       } finally {
         completed += 1;
@@ -693,28 +796,28 @@
   }
 
   function findVideoJsPlayer(video) {
-    if (!video || !window.videojs) return null;
+    if (!video || !pageWindow.videojs) return null;
     try {
-      if (typeof window.videojs.getPlayers === 'function') {
-        const players = window.videojs.getPlayers();
+      if (typeof pageWindow.videojs.getPlayers === 'function') {
+        const players = pageWindow.videojs.getPlayers();
         const player = Object.keys(players || {})
           .map((key) => players[key])
           .find((candidate) => candidate && candidate.el && candidate.el() === video);
         if (player) return player;
       }
-      if (typeof window.videojs.getPlayer === 'function' && video.id) {
-        return window.videojs.getPlayer(video.id);
+      if (typeof pageWindow.videojs.getPlayer === 'function' && video.id) {
+        return pageWindow.videojs.getPlayer(video.id);
       }
     } catch (error) {
-      log('查找Video.js实例失败', error);
+      logError('查找Video.js实例失败', error);
     }
     return null;
   }
 
   function getAngularInjector() {
     try {
-      if (!window.angular || !document.body) return null;
-      return window.angular.element(document.body).injector() || null;
+      if (!pageWindow.angular || !document.body) return null;
+      return pageWindow.angular.element(document.body).injector() || null;
     } catch (_) {
       return null;
     }
@@ -739,7 +842,7 @@
   }
 
   function getLearnScope() {
-    if (!window.angular) return null;
+    if (!pageWindow.angular) return null;
     const root = getAngularRootScope();
     if (root && Array.isArray(root.chapterList)) return root;
     const nodes = document.querySelectorAll(
@@ -747,7 +850,7 @@
     );
     for (const node of nodes) {
       try {
-        const scope = climbScope(window.angular.element(node).scope(), (candidate) =>
+        const scope = climbScope(pageWindow.angular.element(node).scope(), (candidate) =>
           Array.isArray(candidate.chapterList)
         );
         if (scope) return scope;
@@ -780,7 +883,7 @@
       state.patchedVideoService = { videoService, original };
       log('已关闭平台后台失焦暂停策略');
     } catch (error) {
-      log('关闭平台后台暂停策略失败', error);
+      logError('关闭平台后台暂停策略失败', error);
     }
   }
 
@@ -805,7 +908,7 @@
     window.setTimeout(() => {
       if (!shouldRecoverBackgroundPlayback(video)) return;
       applyMediaSettings(video, true);
-      log('后台播放恢复检查', reason);
+      debugLog('后台播放恢复检查', reason);
     }, 80);
   }
 
@@ -834,7 +937,7 @@
         candidates.push(player.options_ && player.options_.sources);
         candidates.push(player.options_ && player.options_.controlBar && player.options_.controlBar.videoSource);
       } catch (error) {
-        log('读取Video.js资源列表失败', error);
+        logError('读取Video.js资源列表失败', error);
       }
     }
 
@@ -868,7 +971,7 @@
         }
       }
     } catch (error) {
-      log('应用播放器设置失败', error);
+      logError('应用播放器设置失败', error);
     }
   }
 
@@ -882,7 +985,7 @@
     }
 
     state.attemptedSources.add(next);
-    log('切换到候选视频资源', next);
+    log('切换到候选视频资源', sanitizeUrlForLog(next));
     notify('当前线路不可用，正在切换视频资源');
     const position = Number(video.currentTime) || 0;
     if (state.player && typeof state.player.src === 'function') {
@@ -945,8 +1048,8 @@
       const unitSource = globals && globals.unitSource;
       const activeNode = document.querySelector('[ng-click*="goSource"].active, .resourcelist .active, .level_2_resourcelist_item.active, .level_3_resourcelist_item.active');
       let activeSource = null;
-      if (activeNode && window.angular) {
-        activeSource = climbScope(window.angular.element(activeNode).scope(), (candidate) =>
+      if (activeNode && pageWindow.angular) {
+        activeSource = climbScope(pageWindow.angular.element(activeNode).scope(), (candidate) =>
           candidate.source && candidate.source.id != null
         );
       }
@@ -1046,13 +1149,18 @@
 
   function loadUnitSources(node, route) {
     if (!node) return Promise.resolve([]);
-    if (Array.isArray(node.unitSource)) return Promise.resolve(node.unitSource);
+    if (Array.isArray(node.unitSource) && node.unitSource.length) return Promise.resolve(node.unitSource);
     const pending = state.unitSourcePromises.get(node);
     if (pending) return pending;
 
     const courseService = getCourseService();
     const params = getRouteParams();
     if (!courseService || typeof courseService.getUnitLearn !== 'function') {
+      logWarning('无法读取课程资源：courseService.getUnitLearn不可用', {
+        route,
+        angularAvailable: Boolean(pageWindow.angular),
+        injectorAvailable: Boolean(getAngularInjector()),
+      });
       return Promise.resolve([]);
     }
 
@@ -1065,49 +1173,134 @@
       load: false,
       hidemsg_: true,
     };
+    state.catalogRequestCount += 1;
+    log('请求课程资源', { request, requestNumber: state.catalogRequestCount });
     const promise = Promise.resolve(courseService.getUnitLearn(request))
       .then((response) => {
         node.unitSource = extractSourceList(response);
+        log('课程资源读取完成', {
+          chapterId: route.chapterId,
+          sectionId: route.sectionId,
+          pointId: route.pointId || '',
+          sourceCount: node.unitSource.length,
+        });
         return node.unitSource;
       })
       .catch((error) => {
-        log('读取课程资源失败', request, error);
+        logError('读取课程资源失败', { request, error });
         return [];
       });
     state.unitSourcePromises.set(node, promise);
     return promise;
   }
 
-  async function collectAllCatalogEntries() {
-    const learnScope = getLearnScope();
-    const chapterList = learnScope && learnScope.chapterList;
-    if (!Array.isArray(chapterList)) return collectCatalogEntries();
-
-    const entries = [];
-    const courseId = getRouteParams().courseId;
-    for (const chapter of chapterList) {
+  function buildCatalogUnits(chapterList, courseId) {
+    const units = [];
+    chapterList.forEach((chapter) => {
       const chapterId = normalizeId(chapter.id);
       const sections = Array.isArray(chapter.children) ? chapter.children : [];
-      for (const section of sections) {
+      sections.forEach((section) => {
         const sectionId = normalizeId(section.id);
-        const sectionSources = await loadUnitSources(section, { courseId, chapterId, sectionId, pointId: '' });
-        sectionSources.forEach((source) => {
-          const entry = makeVideoEntry(source, { courseId, chapterId, sectionId, pointId: '' });
-          if (entry) entries.push(entry);
+        units.push({
+          node: section,
+          route: { courseId, chapterId, sectionId, pointId: '' },
         });
-
         const points = Array.isArray(section.children) ? section.children : [];
-        for (const point of points) {
-          const pointId = normalizeId(point.id);
-          const pointSources = await loadUnitSources(point, { courseId, chapterId, sectionId, pointId });
-          pointSources.forEach((source) => {
-            const entry = makeVideoEntry(source, { courseId, chapterId, sectionId, pointId });
-            if (entry) entries.push(entry);
+        points.forEach((point) => {
+          units.push({
+            node: point,
+            route: {
+              courseId,
+              chapterId,
+              sectionId,
+              pointId: normalizeId(point.id),
+            },
           });
+        });
+      });
+    });
+    return units;
+  }
+
+  function catalogUnitMatchesRoute(unitRoute, currentRoute) {
+    if (!unitRoute || !currentRoute) return false;
+    return normalizeId(unitRoute.chapterId) === normalizeId(currentRoute.chapterId) &&
+      normalizeId(unitRoute.sectionId) === normalizeId(currentRoute.sectionId) &&
+      normalizeId(unitRoute.pointId) === normalizeId(currentRoute.pointId);
+  }
+
+  async function findNextVideoEntryLazy(currentRoute, currentSourceId) {
+    const learnScope = getLearnScope();
+    const chapterList = learnScope && learnScope.chapterList;
+    if (!Array.isArray(chapterList)) {
+      return { available: false, reason: 'chapter-list-unavailable' };
+    }
+
+    const units = buildCatalogUnits(chapterList, currentRoute.courseId);
+    const startUnitIndex = units.findIndex((unit) => catalogUnitMatchesRoute(unit.route, currentRoute));
+    if (startUnitIndex < 0) {
+      logWarning('惰性搜索无法定位当前课程单元', {
+        currentRoute,
+        currentSourceId,
+        unitCount: units.length,
+      });
+      return { available: false, reason: 'current-unit-not-found', unitCount: units.length };
+    }
+
+    let scannedUnitCount = 0;
+    const requestCountAtStart = state.catalogRequestCount;
+    for (let unitIndex = startUnitIndex; unitIndex < units.length; unitIndex += 1) {
+      const unit = units[unitIndex];
+      const sources = await loadUnitSources(unit.node, unit.route);
+      scannedUnitCount += 1;
+
+      let sourceStartIndex = 0;
+      if (unitIndex === startUnitIndex) {
+        const currentIndex = sources.findIndex((source) =>
+          normalizeId(source && source.id) === normalizeId(currentSourceId)
+        );
+        if (currentIndex < 0) {
+          logWarning('当前单元资源中未找到正在播放的视频，跳过当前单元剩余判断', {
+            currentRoute,
+            currentSourceId,
+            sourceCount: sources.length,
+          });
+          sourceStartIndex = sources.length;
+        } else {
+          sourceStartIndex = currentIndex + 1;
         }
       }
+
+      for (let sourceIndex = sourceStartIndex; sourceIndex < sources.length; sourceIndex += 1) {
+        const entry = makeVideoEntry(sources[sourceIndex], unit.route);
+        if (!entry) continue;
+        return {
+          available: true,
+          entry,
+          unitCount: units.length,
+          startUnitIndex,
+          matchedUnitIndex: unitIndex,
+          scannedUnitCount,
+          requestCount: state.catalogRequestCount - requestCountAtStart,
+        };
+      }
+
+      debugLog('惰性搜索单元无后续视频', {
+        unitIndex,
+        route: unit.route,
+        sourceCount: sources.length,
+      });
     }
-    return entries;
+
+    return {
+      available: true,
+      entry: null,
+      unitCount: units.length,
+      startUnitIndex,
+      matchedUnitIndex: -1,
+      scannedUnitCount,
+      requestCount: state.catalogRequestCount - requestCountAtStart,
+    };
   }
 
   function getStateService() {
@@ -1120,11 +1313,11 @@
   }
 
   function findCatalogSourceNode(entry) {
-    if (!window.angular || !entry) return null;
+    if (!pageWindow.angular || !entry) return null;
     const nodes = document.querySelectorAll('[ng-click*="goSource"]');
     for (const node of nodes) {
       try {
-        const scope = climbScope(window.angular.element(node).scope(), (candidate) =>
+        const scope = climbScope(pageWindow.angular.element(node).scope(), (candidate) =>
           candidate.source && candidate.source.id != null
         );
         const source = scope && scope.source;
@@ -1141,13 +1334,103 @@
       node.click();
       return true;
     } catch (error) {
-      log('点击目录视频资源失败', error);
+      logError('点击目录视频资源失败', error);
       return false;
     }
   }
 
   function getTargetSourceState(route) {
     return route.pointId ? 'main.chapter.section.point.source' : 'main.chapter.section.source';
+  }
+
+  function getCatalogRouteFromNode(node) {
+    if (!node) return null;
+    const href = node.getAttribute('href') || '';
+    const numbers = href.replace(/^#\/?/, '').split('/').filter((part) => /^\d+$/.test(part));
+    if (numbers.length < 2) return null;
+    return {
+      courseId: numbers[0] || '',
+      chapterId: numbers[1] || '',
+      sectionId: numbers[2] || '',
+    };
+  }
+
+  function getSectionNavigationNodes() {
+    return Array.from(document.querySelectorAll('[ui-sref]')).filter((node) => {
+      const stateName = node.getAttribute('ui-sref') || '';
+      return stateName.startsWith('main.chapter.section(') && !stateName.includes('.point');
+    });
+  }
+
+  function findNextSectionNode(currentChapterId, currentSectionId) {
+    const routes = getSectionNavigationNodes()
+      .map((node) => ({ node, route: getCatalogRouteFromNode(node) }))
+      .filter((item) => item.route && normalizeId(item.route.chapterId) === normalizeId(currentChapterId));
+    const currentIndex = routes.findIndex((item) =>
+      normalizeId(item.route.sectionId) === normalizeId(currentSectionId)
+    );
+    return routes[currentIndex >= 0 ? currentIndex + 1 : 0] || null;
+  }
+
+  function clickNextSection(currentChapterId, currentSectionId) {
+    const next = findNextSectionNode(currentChapterId, currentSectionId);
+    if (!next || !next.node || typeof next.node.click !== 'function') return null;
+    try {
+      log('点击下一小节', {
+        from: { chapterId: currentChapterId, sectionId: currentSectionId },
+        to: next.route,
+      });
+      next.node.click();
+      return next;
+    } catch (error) {
+      logError('点击下一小节失败', { currentChapterId, currentSectionId, error });
+      return null;
+    }
+  }
+
+  function catalogNodeIsVideo(node) {
+    if (!node) return false;
+    if (node.querySelector('.icon-video, [class*="icon-video"]')) return true;
+    if (!pageWindow.angular) return false;
+    try {
+      const scope = climbScope(pageWindow.angular.element(node).scope(), (candidate) =>
+        candidate.source && candidate.source.id != null
+      );
+      return sourceIsVideo(scope && scope.source);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function waitForSectionVideoNode(sectionId) {
+    const deadline = Date.now() + 9000;
+    while (Date.now() < deadline) {
+      const route = getRouteParams();
+      if (normalizeId(route.sectionId) === normalizeId(sectionId)) {
+        const node = Array.from(document.querySelectorAll('[ng-click*="goSource"]')).find(catalogNodeIsVideo);
+        if (node) return node;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return null;
+  }
+
+  function clickCatalogVideoNode(node) {
+    if (!node || state.navigating || typeof node.click !== 'function') return false;
+    state.navigating = true;
+    try {
+      log('点击小节首个视频DOM节点', {
+        text: (node.textContent || '').trim(),
+        route: getRouteParams(),
+      });
+      node.click();
+      setTimeout(() => { state.navigating = false; }, 900);
+      return true;
+    } catch (error) {
+      state.navigating = false;
+      logError('点击小节首个视频失败', { route: getRouteParams(), error });
+      return false;
+    }
   }
 
   function getChapterNavigationNodes() {
@@ -1158,15 +1441,17 @@
   }
 
   function getChapterItemFromNode(node) {
-    if (!window.angular || !node) return null;
-    try {
-      const scope = climbScope(window.angular.element(node).scope(), (candidate) =>
-        candidate.chapterItem && candidate.chapterItem.id != null
-      );
-      return scope && scope.chapterItem;
-    } catch (_) {
-      return null;
+    if (!node) return null;
+    if (pageWindow.angular) {
+      try {
+        const scope = climbScope(pageWindow.angular.element(node).scope(), (candidate) =>
+          candidate.chapterItem && candidate.chapterItem.id != null
+        );
+        if (scope && scope.chapterItem) return scope.chapterItem;
+      } catch (_) {}
     }
+    const route = getCatalogRouteFromNode(node);
+    return route && route.chapterId ? { id: route.chapterId } : null;
   }
 
   function findNextChapterNode(currentChapterId) {
@@ -1188,10 +1473,14 @@
     const next = findNextChapterNode(currentChapterId);
     if (!next || !next.node || typeof next.node.click !== 'function') return null;
     try {
+      log('点击下一章节', {
+        fromChapterId: currentChapterId,
+        toChapterId: normalizeId(next.item && next.item.id),
+      });
       next.node.click();
       return next;
     } catch (error) {
-      log('点击下一章节失败', error);
+      logError('点击下一章节失败', { currentChapterId, error });
       return null;
     }
   }
@@ -1201,9 +1490,9 @@
     let latest = [];
     while (Date.now() < deadline) {
       try {
-        latest = await collectAllCatalogEntries();
+        latest = collectCatalogEntries();
       } catch (error) {
-        log('等待章节资源时读取目录失败', error);
+        logError('等待章节资源时读取目录失败', { chapterId, currentSourceId, error });
       }
       if (latest.some((entry) =>
         normalizeId(entry.route.chapterId) === normalizeId(chapterId) &&
@@ -1215,12 +1504,26 @@
   }
 
   function navigateToEntry(entry) {
-    if (!entry || state.navigating) return false;
+    if (!entry || state.navigating) {
+      logWarning('跳过视频跳转', {
+        hasEntry: Boolean(entry),
+        navigating: state.navigating,
+        route: getRouteParams(),
+      });
+      return false;
+    }
     state.navigating = true;
+    log('准备跳转视频', {
+      id: entry.id,
+      title: entry.title || '',
+      route: entry.route,
+      currentRoute: getRouteParams(),
+    });
     notify('正在播放：' + (entry.title || entry.id));
 
     // 优先模拟用户点击目录资源，让新旧UI各自执行原生goSource流程。
     if (clickCatalogSource(entry)) {
+      log('通过目录DOM点击完成视频跳转', { id: entry.id, route: entry.route });
       setTimeout(() => { state.navigating = false; }, 900);
       return true;
     }
@@ -1228,6 +1531,10 @@
     const stateService = getStateService();
     if (!stateService || typeof stateService.go !== 'function') {
       state.navigating = false;
+      logWarning('视频跳转失败：目录节点和Angular路由均不可用', {
+        entry: { id: entry.id, title: entry.title || '', route: entry.route },
+        snapshot: getDiagnosticSnapshot(),
+      });
       return false;
     }
 
@@ -1241,8 +1548,23 @@
       pointId: route.pointId || undefined,
       sourceId: entry.id,
     });
+    log('通过Angular路由跳转视频', {
+      targetState,
+      params: {
+        courseId: route.courseId || params.courseId,
+        chapterId: route.chapterId,
+        sectionId: route.sectionId,
+        pointId: route.pointId || undefined,
+        sourceId: entry.id,
+      },
+    });
     Promise.resolve(transition)
-      .catch((error) => log('跳转视频资源失败', error))
+      .then(() => log('Angular路由跳转完成', { targetState, sourceId: entry.id, url: sanitizeUrlForLog(location.href) }))
+      .catch((error) => logError('跳转视频资源失败', {
+        targetState,
+        entry: { id: entry.id, title: entry.title || '', route: entry.route },
+        error,
+      }))
       .finally(() => {
         setTimeout(() => { state.navigating = false; }, 900);
       });
@@ -1250,16 +1572,77 @@
   }
 
   async function playNextVideo() {
-    if (!state.config.autoNext || state.navigating || state.nextRun) return;
+    if (!state.config.autoNext || state.navigating || state.nextRun) {
+      logWarning('跳过自动连播请求', {
+        autoNext: state.config.autoNext,
+        navigating: state.navigating,
+        nextRun: state.nextRun,
+        route: getRouteParams(),
+      });
+      return;
+    }
     state.nextRun = Date.now();
     let currentId = getCurrentSourceId();
-    let currentChapterId = getRouteParams().chapterId;
+    const currentRoute = getRouteParams();
+    log('开始寻找下一个视频', {
+      currentSourceId: currentId,
+      currentRoute,
+      runId: state.nextRun,
+    });
+    let currentChapterId = currentRoute.chapterId;
+    let currentSectionId = currentRoute.sectionId;
     const visitedChapters = new Set();
+    const visitedSections = new Set();
     if (currentChapterId) visitedChapters.add(normalizeId(currentChapterId));
+    if (currentSectionId) visitedSections.add(normalizeId(currentSectionId));
 
     try {
+      const searchStartedAt = performance.now();
+      const lazyResult = await findNextVideoEntryLazy(currentRoute, currentId);
+      log('惰性搜索完成', {
+        elapsedMs: Math.round(performance.now() - searchStartedAt),
+        available: lazyResult.available,
+        reason: lazyResult.reason || '',
+        unitCount: lazyResult.unitCount || 0,
+        startUnitIndex: lazyResult.startUnitIndex == null ? -1 : lazyResult.startUnitIndex,
+        matchedUnitIndex: lazyResult.matchedUnitIndex == null ? -1 : lazyResult.matchedUnitIndex,
+        scannedUnitCount: lazyResult.scannedUnitCount || 0,
+        requestCount: lazyResult.requestCount || 0,
+        nextEntry: lazyResult.entry ? {
+          id: lazyResult.entry.id,
+          title: lazyResult.entry.title || '',
+          route: lazyResult.entry.route,
+        } : null,
+      });
+
+      if (lazyResult.available && lazyResult.entry) {
+        if (navigateToEntry(lazyResult.entry)) return;
+        logWarning('惰性搜索已找到视频但无法直接跳转，改用DOM目录兜底', {
+          entry: {
+            id: lazyResult.entry.id,
+            title: lazyResult.entry.title || '',
+            route: lazyResult.entry.route,
+          },
+        });
+      } else if (lazyResult.available) {
+        notify('已到达课程最后一个可用视频');
+        logWarning('惰性搜索未找到后续视频', {
+          currentId,
+          currentRoute,
+          scannedUnitCount: lazyResult.scannedUnitCount || 0,
+          requestCount: lazyResult.requestCount || 0,
+        });
+        return;
+      } else {
+        logWarning('惰性搜索不可用，改用DOM目录兜底', {
+          reason: lazyResult.reason || 'unknown',
+          currentId,
+          currentRoute,
+        });
+      }
+
       for (let hop = 0; hop < 64; hop += 1) {
-        const entries = await collectAllCatalogEntries();
+        const entries = collectCatalogEntries();
         const uniqueEntries = [];
         const seen = new Set();
         entries.forEach((entry) => {
@@ -1273,16 +1656,52 @@
           ? uniqueEntries.findIndex((entry) => entry.id === currentId)
           : -1;
         const next = currentIndex >= 0 ? uniqueEntries[currentIndex + 1] : null;
+        log('DOM兜底目录扫描', {
+          hop,
+          currentId,
+          currentChapterId,
+          currentSectionId,
+          entryCount: entries.length,
+          uniqueEntryCount: uniqueEntries.length,
+          currentIndex,
+          nextEntry: next ? { id: next.id, title: next.title || '', route: next.route } : null,
+          dom: {
+            chapterNodeCount: getChapterNavigationNodes().length,
+            sectionNodeCount: getSectionNavigationNodes().length,
+            sourceNodeCount: document.querySelectorAll('[ng-click*="goSource"]').length,
+          },
+        });
         if (next && navigateToEntry(next)) return;
+
+        const nextSection = clickNextSection(currentChapterId, currentSectionId);
+        if (nextSection) {
+          const nextSectionId = normalizeId(nextSection.route && nextSection.route.sectionId);
+          if (!nextSectionId || visitedSections.has(nextSectionId)) {
+            logWarning('检测到重复小节，停止小节遍历', { currentChapterId, currentSectionId, nextSectionId });
+          } else {
+            visitedSections.add(nextSectionId);
+            notify('正在进入下一小节');
+            const firstVideoNode = await waitForSectionVideoNode(nextSectionId);
+            if (firstVideoNode && clickCatalogVideoNode(firstVideoNode)) return;
+            logWarning('下一小节未找到可点击的视频节点', {
+              nextSectionId,
+              route: getRouteParams(),
+              sourceNodeCount: document.querySelectorAll('[ng-click*="goSource"]').length,
+            });
+            currentSectionId = nextSectionId;
+            currentId = '';
+            continue;
+          }
+        }
 
         const nextChapter = clickNextChapter(currentChapterId);
         if (!nextChapter) {
           if (!uniqueEntries.length) {
             notify('暂未读取到可用的视频列表');
-            log('课程视频列表为空，无法自动连播', { currentId, currentChapterId });
+            logWarning('课程视频列表为空，无法自动连播', { currentId, currentChapterId });
           } else {
             notify('已到达课程最后一个可用视频');
-            log('没有下一个视频资源', {
+            logWarning('没有下一个视频资源', {
               currentId,
               currentIndex,
               currentChapterId,
@@ -1294,7 +1713,7 @@
 
         const nextChapterId = normalizeId(nextChapter.item && nextChapter.item.id);
         if (!nextChapterId || visitedChapters.has(nextChapterId)) {
-          log('检测到重复章节，停止自动连播', { currentChapterId, nextChapterId });
+          logWarning('检测到重复章节，停止自动连播', { currentChapterId, nextChapterId });
           notify('未找到下一个可播放视频');
           return;
         }
@@ -1310,26 +1729,66 @@
 
         // 当前章节没有视频时继续点击下一个章节，直到目录末尾。
         currentChapterId = nextChapterId;
+        currentSectionId = '';
+        visitedSections.clear();
         currentId = '';
       }
       notify('未找到下一个可播放视频');
-      log('超过章节遍历上限，停止自动连播');
+      logWarning('超过章节遍历上限，停止自动连播');
     } catch (error) {
       notify('自动连播失败，请查看控制台日志');
-      log('自动连播异常', error);
+      logError('自动连播异常', { error, snapshot: getDiagnosticSnapshot() });
     } finally {
-      setTimeout(() => { state.nextRun = 0; }, 500);
+      const finishedRunId = state.nextRun;
+      log('自动连播流程结束', {
+        runId: finishedRunId,
+        route: getRouteParams(),
+        navigating: state.navigating,
+      });
+      setTimeout(() => {
+        if (state.nextRun === finishedRunId) state.nextRun = 0;
+      }, 500);
     }
   }
 
   function onVideoEnded(video, generation) {
-    if (generation !== state.videoGeneration || state.video !== video) return;
-    const key = `${location.href}|${getCurrentSourceId()}`;
-    if (state.handledErrors.has(`ended:${key}`)) return;
-    state.handledErrors.add(`ended:${key}`);
+    if (generation !== state.videoGeneration || state.video !== video) {
+      logWarning('忽略过期播放器的ended事件', {
+        eventGeneration: generation,
+        currentGeneration: state.videoGeneration,
+        isCurrentVideo: state.video === video,
+      });
+      return;
+    }
+    const currentSourceId = getCurrentSourceId();
+    const key = location.href + '|' + currentSourceId;
+    const endedKey = 'ended:' + key;
+    if (state.handledErrors.has(endedKey)) {
+      logWarning('忽略重复ended事件', { currentSourceId, route: getRouteParams() });
+      return;
+    }
+    state.handledErrors.add(endedKey);
     const routeAtEnd = location.href;
+    log('检测到视频播放结束', {
+      generation,
+      currentSourceId,
+      route: getRouteParams(),
+      currentTime: Number(video.currentTime) || 0,
+      duration: Number(video.duration) || 0,
+      nextDelay: state.config.nextDelay,
+    });
     setTimeout(() => {
-      if (generation !== state.videoGeneration || state.video !== video || location.href !== routeAtEnd) return;
+      if (generation !== state.videoGeneration || state.video !== video || location.href !== routeAtEnd) {
+        logWarning('结束后自动连播已取消：播放器或路由发生变化', {
+          eventGeneration: generation,
+          currentGeneration: state.videoGeneration,
+          isCurrentVideo: state.video === video,
+          routeAtEnd: sanitizeUrlForLog(routeAtEnd),
+          currentUrl: sanitizeUrlForLog(location.href),
+        });
+        return;
+      }
+      log('结束等待完成，开始执行自动连播', { currentSourceId, route: getRouteParams() });
       playNextVideo();
     }, state.config.nextDelay);
   }
@@ -1378,11 +1837,36 @@
       const key = `${location.href}|${video.currentSrc || video.src}`;
       if (state.handledErrors.has(key)) return;
       state.handledErrors.add(key);
-      if (!tryNextSource(video)) notify('视频资源不可用，未找到可切换线路');
+      logError('播放器触发error事件', {
+        route: getRouteParams(),
+        currentSrc: sanitizeUrlForLog(video.currentSrc || video.src || ''),
+        mediaError: video.error ? {
+          code: video.error.code,
+          message: video.error.message || '',
+        } : null,
+        networkState: video.networkState,
+        readyState: video.readyState,
+      });
+      if (!tryNextSource(video)) {
+        logWarning('视频资源不可用，未找到可切换线路', {
+          currentSrc: sanitizeUrlForLog(video.currentSrc || video.src || ''),
+          attemptedSources: Array.from(state.attemptedSources).map(sanitizeUrlForLog),
+        });
+        notify('视频资源不可用，未找到可切换线路');
+      }
     }, { passive: true });
 
     applyMediaSettings(video, true);
-    log('已接管播放器', { currentSrc: video.currentSrc, sources: getPlayerSources(video, state.player) });
+    log('已接管播放器', {
+      generation,
+      route: getRouteParams(),
+      currentSourceId: getCurrentSourceId(),
+      currentSrc: sanitizeUrlForLog(video.currentSrc || video.src || ''),
+      sources: getPlayerSources(video, state.player).map(sanitizeUrlForLog),
+      videoJsPlayerFound: Boolean(state.player),
+      readyState: video.readyState,
+      networkState: video.networkState,
+    });
   }
 
   function scan() {
@@ -1588,7 +2072,13 @@
   function observe() {
     const observer = new MutationObserver(() => {
       if (location.href !== state.lastRoute) {
+        const previousUrl = state.lastRoute;
         state.lastRoute = location.href;
+        log('检测到页面路由变化', {
+          from: sanitizeUrlForLog(previousUrl),
+          to: sanitizeUrlForLog(state.lastRoute),
+          route: getRouteParams(),
+        });
         state.video = null;
         state.player = null;
         state.handledErrors.clear();
@@ -1604,6 +2094,16 @@
   }
 
   function start() {
+    installDebugApi();
+    log('脚本启动', {
+      version: SCRIPT_VERSION,
+      url: sanitizeUrlForLog(location.href),
+      runAt: document.readyState,
+      unsafeWindowAvailable: typeof unsafeWindow !== 'undefined',
+      angularAvailable: Boolean(pageWindow.angular),
+      videoJsAvailable: Boolean(pageWindow.videojs),
+      config: getDiagnosticSnapshot().config,
+    });
     installControls();
     startBackgroundPlaybackGuard();
     observe();
