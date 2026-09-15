@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.6.5
-// @description  自动控制UOOC视频播放，导出测验题目，并提供仅供参考的AI选项分析。
+// @version      0.7.0
+// @description  自动控制UOOC视频播放、课程讨论和题目导出，并提供仅供参考的AI选项分析。
 // @author       Liunian06
 // @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
 // @match        *://*.uooc.net.cn/home/learn/*
 // @match        *://*.uooconline.com/home/learn/*
 // @match        *://*.uooc.online/home/learn/*
+// @match        *://www.uooc.net.cn/home/course/*
+// @match        *://*.uooc.net.cn/home/course/*
+// @match        *://*.uooconline.com/home/course/*
+// @match        *://*.uooc.online/home/course/*
 // @match        *://www.uooc.net.cn/exam/*
 // @match        *://*.uooc.net.cn/exam/*
 // @match        *://*.uooconline.com/exam/*
@@ -26,7 +30,7 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.6.5';
+  const SCRIPT_VERSION = '0.7.0';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const DEFAULT_CONFIG = Object.freeze({
@@ -42,6 +46,8 @@
     aiApiKey: '',
     aiModel: '',
     aiTimeout: 45000,
+    discussionCount: 1,
+    discussionUnlimited: false,
   });
   const AI_MAX_CONCURRENCY = 10;
 
@@ -64,6 +70,19 @@
     aiQueue: { active: 0, pending: [] },
     aiResults: new WeakMap(),
     aiRunning: false,
+    discussion: {
+      running: false,
+      phase: 'idle',
+      completed: 0,
+      target: 1,
+      timer: null,
+      runId: 0,
+      lastPage: 0,
+      lastThreadId: '',
+      lastContent: '',
+      remainingMs: 0,
+    },
+    controlsUpdate: null,
   };
 
   function loadConfig() {
@@ -154,6 +173,8 @@
         muted: state.config.muted,
         keepBackground: state.config.keepBackground,
         nextDelay: state.config.nextDelay,
+        discussionCount: state.config.discussionCount,
+        discussionUnlimited: state.config.discussionUnlimited,
       },
       runtime: {
         angularAvailable: Boolean(pageWindow.angular),
@@ -166,6 +187,15 @@
         handledErrorCount: state.handledErrors.size,
         catalogRequestCount: state.catalogRequestCount,
         attemptedSources: Array.from(state.attemptedSources).map(sanitizeUrlForLog),
+        discussion: {
+          running: state.discussion.running,
+          phase: state.discussion.phase,
+          completed: state.discussion.completed,
+          target: state.discussion.target,
+          lastPage: state.discussion.lastPage,
+          lastThreadId: state.discussion.lastThreadId,
+          remainingMs: state.discussion.remainingMs,
+        },
       },
       dom: {
         videoCount: document.querySelectorAll('video').length,
@@ -225,6 +255,450 @@
     state.statusTimer = setTimeout(() => {
       box.style.display = 'none';
     }, timeout);
+  }
+
+  const DISCUSSION_WAIT_MS = 120000;
+  const DISCUSSION_OPERATION_TIMEOUT = 18000;
+
+  function refreshControls() {
+    if (typeof state.controlsUpdate === 'function') state.controlsUpdate();
+  }
+
+  function sleep(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  function createStoppedDiscussionError() {
+    const error = new Error('自动讨论已停止');
+    error.code = 'DISCUSSION_STOPPED';
+    return error;
+  }
+
+  function assertDiscussionRun(runId) {
+    if (!state.discussion.running || state.discussion.runId !== runId) {
+      throw createStoppedDiscussionError();
+    }
+  }
+
+  async function waitForCondition(predicate, options = {}) {
+    const timeout = Math.max(500, Number(options.timeout) || 10000);
+    const interval = Math.max(50, Number(options.interval) || 250);
+    const runId = options.runId;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (runId != null) assertDiscussionRun(runId);
+      try {
+        const value = await predicate();
+        if (value) return value;
+      } catch (error) {
+        if (error && error.code === 'DISCUSSION_STOPPED') throw error;
+      }
+      await sleep(interval);
+    }
+    return null;
+  }
+
+  function getDiscussionRoute() {
+    const segments = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
+    const normalized = segments.map((part) => {
+      try { return decodeURIComponent(part); } catch (_) { return part; }
+    });
+    const stateService = getStateService();
+    const stateName = stateService && stateService.current && stateService.current.name || '';
+    const stateParams = stateService && stateService.params || {};
+    const pathMatch = location.pathname.match(/\/home\/course(?:\/new)?\/(\d+)/i);
+    const courseId = String(
+      stateParams.courseId ||
+      (pathMatch && pathMatch[1]) ||
+      pageWindow.cid ||
+      ''
+    );
+    const isNewDetail = normalized.includes('discussDetail') || stateName === 'course.discuss.discussDetail';
+    const isNewList = !isNewDetail && (normalized[0] === 'discuss' || stateName === 'course.discuss');
+    const isOldDetail = normalized[0] === 'discussdetail' || stateName === 'course.discussdetail';
+    const isOldList = !isOldDetail && normalized[0] === 'discusscom' || stateName === 'course.discusscom';
+    let threadId = String(stateParams.tid || '');
+    if (!threadId && isOldDetail && normalized[2]) threadId = normalized[2];
+    if (!threadId && isNewDetail) {
+      const numericSegments = normalized.filter((part) => /^\d+$/.test(part));
+      threadId = numericSegments[0] || '';
+    }
+    return {
+      kind: isNewDetail || isOldDetail ? 'detail' : isNewList || isOldList ? 'list' : '',
+      mode: isNewDetail || isNewList ? 'new' : isOldDetail || isOldList ? 'old' : '',
+      courseId,
+      threadId,
+      stateName,
+    };
+  }
+
+  function findDiscussionScope(nodes, predicate) {
+    if (!pageWindow.angular) return null;
+    for (const node of nodes) {
+      try {
+        const scope = climbScope(pageWindow.angular.element(node).scope(), predicate);
+        if (scope) return scope;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function getDiscussionListScope() {
+    if (!pageWindow.angular) return null;
+    const nodes = document.querySelectorAll([
+      '[ng-repeat*="chapter_tiezi in questionList[2]"]',
+      '[ng-repeat*="tiezi in studentList[0]"]',
+      '[ng-repeat*="tiezi in comList"]',
+      '[uooc-pager]',
+      '.Discuz',
+    ].join(','));
+    return findDiscussionScope(nodes, (candidate) =>
+      (typeof candidate.getPageDiscussion === 'function' && candidate.questionListPaper) ||
+      (typeof candidate.getCourseDiscussionList === 'function' && candidate.noteListPaper)
+    );
+  }
+
+  function getDiscussionDetailScope() {
+    if (!pageWindow.angular) return null;
+    const nodes = document.querySelectorAll([
+      '[thread-detail]',
+      '[ng-bind-html*="threads.content"]',
+      '.discussionDesc',
+      '.thesis-content',
+      '.discuss-header',
+    ].join(','));
+    return findDiscussionScope(nodes, (candidate) =>
+      (candidate.threads && (typeof candidate.replay === 'function' || typeof candidate.getList === 'function' || typeof candidate.handleRelease === 'function'))
+    );
+  }
+
+  function getDiscussionList(scope) {
+    if (!scope) return [];
+    if (Array.isArray(scope.studentList && scope.studentList[0])) return scope.studentList[0];
+    if (Array.isArray(scope.comList)) return scope.comList;
+    if (Array.isArray(scope.questionList && scope.questionList[2])) return scope.questionList[2];
+    return [];
+  }
+
+  function getDiscussionPage(scope, mode) {
+    if (!scope) return 0;
+    if (mode === 'new' && scope.noteListPaper) return Number(scope.noteListPaper.page) || 0;
+    if (scope.questionListPaper && scope.questionListPaper[2]) {
+      return Number(scope.questionListPaper[2].page) || 0;
+    }
+    return Number(scope.noteListPaper && scope.noteListPaper.page) || 0;
+  }
+
+  function getDiscussionPageCount(scope, mode) {
+    if (!scope) return 0;
+    if (mode === 'new' && scope.noteListPaper) return Number(scope.noteListPaper.total) || 0;
+    if (scope.questionListPaper && scope.questionListPaper[2]) {
+      return Number(scope.questionListPaper[2].pageCount || scope.questionListPaper[2].pages) || 0;
+    }
+    return Number(scope.noteListPaper && (scope.noteListPaper.total || scope.noteListPaper.pages)) || 0;
+  }
+
+  function discussionItemId(item) {
+    if (!item) return '';
+    return String(item.tid || item.thread_id || item.topic_id || item.id || '');
+  }
+
+  function discussionListFingerprint(list) {
+    return (Array.isArray(list) ? list : []).map((item) =>
+      discussionItemId(item) + ':' + String(item && (item.content || item.subject || item.title || '')).slice(0, 80)
+    ).join('|');
+  }
+
+  function invokeAngular(scope, callback) {
+    return new Promise((resolve, reject) => {
+      const execute = () => {
+        try {
+          const result = callback();
+          if (result && typeof result.then === 'function') {
+            result.then(resolve, reject);
+          } else {
+            resolve(result);
+          }
+        } catch (error) {
+          reject(error);
+        }
+      };
+      if (scope && typeof scope.$evalAsync === 'function') scope.$evalAsync(execute);
+      else execute();
+    });
+  }
+
+  function randomInteger(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  async function waitForDiscussionList(runId, mode) {
+    return waitForCondition(() => {
+      const scope = getDiscussionListScope();
+      if (!scope) return null;
+      const list = getDiscussionList(scope);
+      const pageCount = getDiscussionPageCount(scope, mode);
+      if (!Array.isArray(list) || !pageCount) return null;
+      return { scope, list, pageCount };
+    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, runId });
+  }
+
+  async function switchDiscussionPage(scope, mode, page, runId) {
+    const beforeList = getDiscussionList(scope);
+    const before = discussionListFingerprint(getDiscussionList(scope));
+    await invokeAngular(scope, () => {
+      if (mode === 'new') {
+        if (scope.noteListPaper) scope.noteListPaper.page = page;
+        if (typeof scope.getNoteList === 'function') return scope.getNoteList(page);
+        if (typeof scope.getCourseDiscussionList === 'function') return scope.getCourseDiscussionList(page);
+      } else {
+        if (scope.questionListPaper && scope.questionListPaper[2]) scope.questionListPaper[2].page = page;
+        if (typeof scope.getPageDiscussion === 'function') return scope.getPageDiscussion(page);
+        if (typeof scope.getDiscussion === 'function') return scope.getDiscussion(page, 2);
+      }
+      throw new Error('未找到当前版本的讨论分页函数');
+    });
+    const switched = await waitForCondition(() => {
+      const currentScope = getDiscussionListScope();
+      if (!currentScope) return null;
+      const list = getDiscussionList(currentScope);
+      const currentPage = getDiscussionPage(currentScope, mode);
+      const changed = list !== beforeList || discussionListFingerprint(list) !== before;
+      if (currentPage === page && (changed || page === 1 || list.length === 0)) {
+        return { scope: currentScope, list };
+      }
+      return null;
+    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, runId });
+    if (!switched) throw new Error('讨论分页加载超时');
+    return getDiscussionListScope();
+  }
+
+  function navigateDiscussionDetail(route, threadId) {
+    const stateService = getStateService();
+    if (stateService && typeof stateService.go === 'function') {
+      const target = route.mode === 'new' ? 'course.discuss.discussDetail' : 'course.discussdetail';
+      const params = route.mode === 'new'
+        ? { tid: String(threadId), courseId: route.courseId }
+        : { type: 'com', tid: String(threadId), courseId: route.courseId };
+      return Promise.resolve(stateService.go(target, params));
+    }
+    location.hash = route.mode === 'new'
+      ? '#/discuss/' + encodeURIComponent(threadId) + '/' + encodeURIComponent(route.courseId) + '/discussDetail'
+      : '#/discussdetail/com/' + encodeURIComponent(threadId);
+    return Promise.resolve();
+  }
+
+  function navigateDiscussionList(route) {
+    const stateService = getStateService();
+    if (stateService && typeof stateService.go === 'function') {
+      return Promise.resolve(stateService.go(route.mode === 'new' ? 'course.discuss' : 'course.discusscom', {}));
+    }
+    location.hash = route.mode === 'new' ? '#/discuss' : '#/discusscom';
+    return Promise.resolve();
+  }
+
+  function discussionHtmlToText(value) {
+    const source = String(value || '').trim();
+    if (!source) return '';
+
+    const container = document.createElement('div');
+    container.innerHTML = source;
+    container.querySelectorAll('br').forEach((node) => {
+      node.replaceWith(document.createTextNode('\n'));
+    });
+    container.querySelectorAll('p,div,li,section,article').forEach((node) => {
+      node.appendChild(document.createTextNode('\n'));
+    });
+
+    return (container.textContent || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function getDiscussionContent(scope) {
+    const raw = scope && scope.threads && scope.threads.content;
+    if (raw && String(raw).trim()) return discussionHtmlToText(raw);
+    const node = document.querySelector('[ng-bind-html="threads.content | to_trusted"], .discussionDesc, .thesis-content');
+    return node ? discussionHtmlToText(node.innerHTML || node.textContent || '') : '';
+  }
+
+  function setDiscussionEditorContent(content) {
+    const editor = pageWindow.DIR_EDITORS && (pageWindow.DIR_EDITORS.noteEditorAll || pageWindow.DIR_EDITORS.noteEditor);
+    if (editor && typeof editor.setContent === 'function') {
+      try { editor.setContent(content); } catch (_) {}
+    }
+    document.querySelectorAll('textarea[ng-model="content"], textarea[ng-model="noteContent"]').forEach((textarea) => {
+      const setter = Object.getOwnPropertyDescriptor(pageWindow.HTMLTextAreaElement.prototype, 'value');
+      if (setter && setter.set) setter.set.call(textarea, content);
+      else textarea.value = content;
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  async function sendDiscussionReply(route, threadId, content, runId) {
+    const detailScope = await waitForCondition(() => getDiscussionDetailScope(), {
+      timeout: DISCUSSION_OPERATION_TIMEOUT,
+      interval: 250,
+      runId,
+    });
+    if (!detailScope) throw new Error('帖子详情未加载完成，无法发送回复');
+    setDiscussionEditorContent(content);
+    const courseService = getCourseService();
+    if (!courseService || typeof courseService.discReply !== 'function') {
+      throw new Error('当前页面未找到讨论回复接口');
+    }
+    const response = await invokeAngular(detailScope, () => courseService.discReply({
+      cid: route.courseId,
+      tid: String(threadId),
+      content,
+      images: null,
+    }));
+    await sleep(800);
+    try {
+      await invokeAngular(detailScope, () => {
+        if (typeof detailScope.getList === 'function') return detailScope.getList();
+        if (typeof detailScope.getDetail === 'function') return detailScope.getDetail();
+        return null;
+      });
+    } catch (_) {}
+    return response;
+  }
+
+  function waitForDiscussionDelay(runId) {
+    state.discussion.phase = 'waiting';
+    refreshControls();
+    return new Promise((resolve, reject) => {
+      const deadline = Date.now() + DISCUSSION_WAIT_MS;
+      const tick = () => {
+        try {
+          assertDiscussionRun(runId);
+          const remaining = Math.max(0, deadline - Date.now());
+          state.discussion.remainingMs = remaining;
+          refreshControls();
+          if (!remaining) {
+            clearInterval(state.discussion.timer);
+            state.discussion.timer = null;
+            resolve();
+          }
+        } catch (error) {
+          clearInterval(state.discussion.timer);
+          state.discussion.timer = null;
+          reject(error);
+        }
+      };
+      state.discussion.timer = setInterval(tick, 1000);
+      tick();
+    });
+  }
+
+  function formatDiscussionRemaining(milliseconds) {
+    const seconds = Math.ceil(Math.max(0, Number(milliseconds) || 0) / 1000);
+    const minutes = Math.floor(seconds / 60);
+    return minutes + '分' + String(seconds % 60).padStart(2, '0') + '秒';
+  }
+
+  function finishDiscussion(message) {
+    clearInterval(state.discussion.timer);
+    state.discussion.timer = null;
+    state.discussion.running = false;
+    state.discussion.phase = 'idle';
+    state.discussion.remainingMs = 0;
+    refreshControls();
+    if (message) notify(message, 3200);
+  }
+
+  function stopDiscussion(message = '自动讨论已停止') {
+    state.discussion.runId += 1;
+    finishDiscussion(message);
+  }
+
+  async function runDiscussionLoop(runId, route) {
+    try {
+      while (true) {
+        assertDiscussionRun(runId);
+        const listState = await waitForDiscussionList(runId, route.mode);
+        if (!listState) throw new Error('综合讨论列表加载超时');
+        const page = randomInteger(1, listState.pageCount);
+        state.discussion.phase = 'page';
+        state.discussion.lastPage = page;
+        refreshControls();
+        const pageScope = await switchDiscussionPage(listState.scope, route.mode, page, runId);
+        const list = getDiscussionList(pageScope || getDiscussionListScope());
+        if (!list.length) throw new Error('随机页没有可用帖子');
+        const item = list[randomInteger(0, list.length - 1)];
+        const threadId = discussionItemId(item);
+        if (!threadId) throw new Error('随机帖子缺少帖子ID');
+        state.discussion.lastThreadId = threadId;
+        state.discussion.phase = 'detail';
+        refreshControls();
+        await navigateDiscussionDetail(route, threadId);
+        const detailRoute = await waitForCondition(() => {
+          const current = getDiscussionRoute();
+          return current.kind === 'detail' && current.threadId === threadId;
+        }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, runId });
+        if (!detailRoute) throw new Error('帖子详情路由切换超时');
+        const detailScope = await waitForCondition(() => getDiscussionDetailScope(), {
+          timeout: DISCUSSION_OPERATION_TIMEOUT,
+          interval: 250,
+          runId,
+        });
+        if (!detailScope) throw new Error('帖子详情加载超时');
+        const content = getDiscussionContent(detailScope);
+        if (!content) throw new Error('帖子内容为空，无法发送回复');
+        state.discussion.lastContent = content;
+        await sendDiscussionReply(route, threadId, content, runId);
+        assertDiscussionRun(runId);
+        state.discussion.completed += 1;
+        refreshControls();
+        if (!state.config.discussionUnlimited && state.discussion.completed >= state.discussion.target) {
+          finishDiscussion('自动讨论已完成' + state.discussion.completed + '次');
+          return;
+        }
+        await waitForDiscussionDelay(runId);
+        assertDiscussionRun(runId);
+        state.discussion.phase = 'returning';
+        refreshControls();
+        await navigateDiscussionList(route);
+        const listRoute = await waitForCondition(() => {
+          const current = getDiscussionRoute();
+          return current.kind === 'list' && current.mode === route.mode;
+        }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, runId });
+        if (!listRoute) throw new Error('返回综合讨论页超时');
+      }
+    } catch (error) {
+      if (error && error.code === 'DISCUSSION_STOPPED') return;
+      logError('自动讨论失败', { error, route: getDiscussionRoute(), discussion: state.discussion });
+      finishDiscussion('自动讨论已停止：' + (error && error.message ? error.message : '页面结构不兼容'));
+    }
+  }
+
+  function startDiscussion() {
+    const route = getDiscussionRoute();
+    if (route.kind !== 'list') {
+      notify('请先进入课程的综合讨论页');
+      return;
+    }
+    if (state.discussion.running) return;
+    const count = Math.max(1, Math.floor(Number(state.config.discussionCount) || 1));
+    state.config.discussionCount = count;
+    saveConfig();
+    state.discussion.running = true;
+    state.discussion.phase = 'loading';
+    state.discussion.completed = 0;
+    state.discussion.target = count;
+    state.discussion.lastPage = 0;
+    state.discussion.lastThreadId = '';
+    state.discussion.lastContent = '';
+    state.discussion.remainingMs = 0;
+    state.discussion.runId += 1;
+    const runId = state.discussion.runId;
+    refreshControls();
+    notify(state.config.discussionUnlimited ? '自动讨论已启动，将持续执行' : '自动讨论已启动，共' + count + '次');
+    runDiscussionLoop(runId, route);
   }
 
   function getQuizDocuments() {
@@ -1921,6 +2395,15 @@
       '.fastuooc-auto-player-ai{display:flex!important;align-items:center;justify-content:center;width:100%!important;height:36px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 8px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important}',
       '.fastuooc-auto-player-ai:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
       '.fastuooc-auto-player-ai:disabled{opacity:.55!important;cursor:not-allowed!important}',
+      '.fastuooc-auto-discussion{display:flex;flex-direction:column;gap:7px;padding:9px 10px;border:1px solid var(--panel-border);border-radius:10px;background:rgba(15,23,42,.08)}',
+      '.fastuooc-auto-discussion-title{display:flex;align-items:center;justify-content:space-between;color:var(--panel-text);font-weight:650;font-size:12px}',
+      '.fastuooc-auto-discussion-settings{display:flex;align-items:center;gap:8px;color:var(--panel-muted);font-size:11px}',
+      '.fastuooc-auto-discussion-count{width:58px;height:27px;border:1px solid var(--panel-border);border-radius:6px;padding:0 7px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+      '.fastuooc-auto-discussion-unlimited{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}',
+      '.fastuooc-auto-discussion-unlimited input{margin:0}',
+      '.fastuooc-auto-discussion-toggle{width:100%;height:34px;border:1px solid var(--panel-border);border-radius:8px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+      '.fastuooc-auto-discussion-toggle:hover{background:#2563eb;border-color:#60a5fa;color:#fff}',
+      '.fastuooc-auto-discussion-toggle.is-running{background:#b91c1c;border-color:#f87171;color:#fff}',
       '.fastuooc-auto-player-theme{display:flex!important;align-items:center;justify-content:space-between;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:left}',
       '.fastuooc-auto-player-theme:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
       '.fastuooc-auto-player-theme-value{color:var(--panel-muted);font-size:11px}',
@@ -1971,6 +2454,14 @@
         '<button class="fastuooc-auto-player-ai" data-action="ai-analyze" title="获取AI参考选项，不会自动作答">AI参考</button>',
         '<button class="fastuooc-auto-player-ai" data-action="ai-settings" title="配置OpenAI兼容接口">AI设置</button>',
         '</div>',
+        '<div class="fastuooc-auto-discussion">',
+        '<div class="fastuooc-auto-discussion-title"><span>自动讨论</span><span data-role="discussion-summary"></span></div>',
+        '<div class="fastuooc-auto-discussion-settings">',
+        '<label>次数 <input class="fastuooc-auto-discussion-count" data-role="discussion-count" type="number" min="1" step="1" inputmode="numeric"></label>',
+        '<label class="fastuooc-auto-discussion-unlimited"><input data-action="discussion-unlimited" type="checkbox">无上限</label>',
+        '</div>',
+        '<button class="fastuooc-auto-discussion-toggle" data-action="discussion-toggle" title="在综合讨论页开始或停止自动讨论">开始自动讨论</button>',
+        '</div>',
         '<button class="fastuooc-auto-player-theme" data-action="theme" title="切换界面主题：跟随系统、浅色、深色" aria-label="切换界面主题">',
         '<span>界面主题</span><span class="fastuooc-auto-player-theme-value"></span>',
         '</button>',
@@ -1984,6 +2475,10 @@
         const background = box.querySelector('[data-action="background"]');
         const theme = box.querySelector('[data-action="theme"]');
         const aiAnalyze = box.querySelector('[data-action="ai-analyze"]');
+        const discussionCount = box.querySelector('[data-role="discussion-count"]');
+        const discussionUnlimited = box.querySelector('[data-action="discussion-unlimited"]');
+        const discussionToggle = box.querySelector('[data-action="discussion-toggle"]');
+        const discussionSummary = box.querySelector('[data-role="discussion-summary"]');
         const masterEnabled = state.config.enabled;
         const themeMode = ['system', 'light', 'dark'].includes(state.config.theme) ? state.config.theme : 'system';
         const themeLabel = themeMode === 'system' ? '跟随系统' : themeMode === 'light' ? '浅色' : '深色';
@@ -1997,10 +2492,26 @@
         });
         aiAnalyze.disabled = state.aiRunning;
         aiAnalyze.textContent = state.aiRunning ? '分析中…' : 'AI参考';
+        if (document.activeElement !== discussionCount) discussionCount.value = state.config.discussionCount;
+        discussionUnlimited.checked = Boolean(state.config.discussionUnlimited);
+        discussionCount.disabled = state.discussion.running || state.config.discussionUnlimited;
+        discussionUnlimited.disabled = state.discussion.running;
+        discussionToggle.classList.toggle('is-running', state.discussion.running);
+        discussionToggle.textContent = state.discussion.running ? '停止自动讨论' : '开始自动讨论';
+        const discussionPhase = state.discussion.phase === 'waiting'
+          ? '等待' + formatDiscussionRemaining(state.discussion.remainingMs)
+          : state.discussion.phase === 'idle' ? '未运行' : state.discussion.phase;
+        discussionSummary.textContent = state.discussion.running
+          ? state.discussion.completed + '/' + (state.config.discussionUnlimited ? '∞' : state.discussion.target) + ' · ' + discussionPhase
+          : discussionPhase;
         theme.querySelector('.fastuooc-auto-player-theme-value').textContent = themeLabel;
         theme.setAttribute('aria-label', `切换界面主题，当前为${themeLabel}`);
-        box.querySelector('[data-role="state"]').textContent = masterEnabled ? `${state.config.speed}倍速 · 静音 · 后台播放 · ${themeLabel}` : `${state.config.speed}倍速 · ${state.config.autoNext ? '连播' : '不连播'} · ${state.config.muted ? '静音' : '有声'} · ${state.config.keepBackground ? '后台播放' : '前台播放'} · ${themeLabel}`;
+        const discussionDetail = state.discussion.running
+          ? '自动讨论第' + (state.discussion.completed + 1) + '次' + (state.discussion.lastPage ? ' · 第' + state.discussion.lastPage + '页' : '')
+          : '自动讨论未运行';
+        box.querySelector('[data-role="state"]').textContent = masterEnabled ? `${state.config.speed}倍速 · 静音 · 后台播放 · ${themeLabel} · ${discussionDetail}` : `${state.config.speed}倍速 · ${state.config.autoNext ? '连播' : '不连播'} · ${state.config.muted ? '静音' : '有声'} · ${state.config.keepBackground ? '后台播放' : '前台播放'} · ${themeLabel} · ${discussionDetail}`;
       };
+      state.controlsUpdate = update;
       box.addEventListener('click', (event) => {
         const control = event.target.closest('[data-action]');
         if (!control || !box.contains(control)) return;
@@ -2049,6 +2560,18 @@
           })();
           return;
         }
+        if (action === 'discussion-toggle') {
+          if (state.discussion.running) stopDiscussion();
+          else startDiscussion();
+          update();
+          return;
+        }
+        if (action === 'discussion-unlimited') {
+          state.config.discussionUnlimited = control.checked;
+          saveConfig();
+          update();
+          return;
+        }
         if (action === 'enabled') state.config.enabled = !state.config.enabled;
         if (action === 'next' && !state.config.enabled) state.config.autoNext = !state.config.autoNext;
         if (action === 'mute' && !state.config.enabled) state.config.muted = !state.config.muted;
@@ -2061,6 +2584,13 @@
         saveConfig();
         update();
         scan();
+      });
+      box.addEventListener('input', (event) => {
+        if (!event.target.matches('[data-role="discussion-count"]')) return;
+        const value = Math.max(1, Math.floor(Number(event.target.value) || 1));
+        state.config.discussionCount = value;
+        saveConfig();
+        refreshControls();
       });
       (document.body || document.documentElement).appendChild(box);
       update();
