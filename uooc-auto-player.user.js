@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.7.0
+// @version      0.7.2
 // @description  自动控制UOOC视频播放、课程讨论和题目导出，并提供仅供参考的AI选项分析。
 // @author       Liunian06
 // @license      MIT
@@ -30,7 +30,7 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.7.0';
+  const SCRIPT_VERSION = '0.7.2';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const DEFAULT_CONFIG = Object.freeze({
@@ -92,6 +92,7 @@
       delete stored.aiApiKey;
       if (legacyApiKey) localStorage.setItem(CONFIG_KEY, JSON.stringify(stored));
       const config = Object.assign({}, DEFAULT_CONFIG, stored);
+      config.speed = DEFAULT_CONFIG.speed;
       try {
         config.aiApiKey = (typeof GM_getValue === 'function' && GM_getValue('fastuooc:ai-api-key', '')) || legacyApiKey;
       } catch (_) {
@@ -1424,7 +1425,7 @@
 
   function applyMediaSettings(video, shouldPlay = false) {
     if (!video) return;
-    const speed = Number(state.config.speed) || 2;
+    const speed = DEFAULT_CONFIG.speed;
     try {
       video.defaultPlaybackRate = speed;
       video.playbackRate = speed;
@@ -2350,6 +2351,17 @@
     if (video) bindVideo(video);
   }
 
+  function getControlPage() {
+    const isCoursePage = /^\/home\/course\/(?:new\/)?\d+(?:\/|$)/i.test(location.pathname);
+    const section = location.hash.replace(/^#\/?/, '').split('/')[0].toLowerCase();
+    return {
+      playback: /^\/home\/learn(?:\/|$)/i.test(location.pathname) && !['test', 'exam'].includes(section),
+      quiz: /^\/exam(?:\/|$)/i.test(location.pathname) ||
+        (isCoursePage && (section === 'test' || section === 'exam')),
+      discussion: isCoursePage && ['discuss', 'discusscom', 'discussdetail'].includes(section),
+    };
+  }
+
   function installControls() {
     const style = document.createElement('style');
     style.textContent = [
@@ -2359,8 +2371,9 @@
       '@media (prefers-color-scheme:light){#fastuooc-auto-player-controls[data-theme="system"]{--panel-bg:rgba(255,255,255,.96);--panel-border:rgba(15,23,42,.12);--panel-text:#172033;--panel-muted:#64748b;--button-bg:#f1f5f9;--button-text:#334155}}',
       '@media (prefers-color-scheme:dark){#fastuooc-auto-player-controls[data-theme="system"]{--panel-bg:rgba(18,24,36,.96);--panel-border:rgba(148,163,184,.22);--panel-text:#e7edf7;--panel-muted:#94a3b8;--button-bg:rgba(51,65,85,.68);--button-text:#dbeafe}}',
       '#fastuooc-auto-player-controls:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(15,23,42,.34),0 3px 10px rgba(15,23,42,.2)}',
+      '#fastuooc-auto-player-controls [hidden]{display:none!important}',
       '#fastuooc-auto-player-controls.is-collapsed{width:42px;border-radius:21px}',
-      '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title-main,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-body,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-github{display:none}',
+      '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title-main,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-body,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-github,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-theme{display:none!important}',
       '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title{justify-content:center;padding:9px 0}',
       '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title-tools{display:block}',
       '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-collapse svg{transform:rotate(180deg)}',
@@ -2404,10 +2417,10 @@
       '.fastuooc-auto-discussion-toggle{width:100%;height:34px;border:1px solid var(--panel-border);border-radius:8px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
       '.fastuooc-auto-discussion-toggle:hover{background:#2563eb;border-color:#60a5fa;color:#fff}',
       '.fastuooc-auto-discussion-toggle.is-running{background:#b91c1c;border-color:#f87171;color:#fff}',
-      '.fastuooc-auto-player-theme{display:flex!important;align-items:center;justify-content:space-between;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:left}',
-      '.fastuooc-auto-player-theme:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
-      '.fastuooc-auto-player-theme-value{color:var(--panel-muted);font-size:11px}',
-      '.fastuooc-auto-player-theme:hover .fastuooc-auto-player-theme-value{color:rgba(255,255,255,.82)}',
+      '.fastuooc-auto-player-theme{display:inline-flex!important;align-items:center;justify-content:center;width:30px!important;height:30px!important;flex:none;border:0!important;border-radius:50%!important;padding:0!important;background:transparent!important;color:var(--panel-muted)!important;transform:none!important}',
+      '.fastuooc-auto-player-theme:hover{background:var(--button-bg)!important;color:var(--panel-text)!important}',
+      '.fastuooc-auto-player-theme svg{display:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}',
+      '#fastuooc-auto-player-controls[data-theme="system"] .fastuooc-auto-player-theme svg[data-mode="system"],#fastuooc-auto-player-controls[data-theme="light"] .fastuooc-auto-player-theme svg[data-mode="light"],#fastuooc-auto-player-controls[data-theme="dark"] .fastuooc-auto-player-theme svg[data-mode="dark"]{display:block}',
       '.fastuooc-auto-player-state{align-self:flex-start;color:var(--panel-muted);font-size:12px;white-space:nowrap}',
       '@media (max-width:480px){#fastuooc-auto-player-controls{right:10px;bottom:10px;width:min(318px,calc(100vw - 20px))}}',
     ].join('');
@@ -2424,6 +2437,11 @@
         '<a class="fastuooc-auto-player-github" href="https://github.com/Liunian06/fastuooc" target="_blank" rel="noopener noreferrer" title="打开GitHub项目主页" aria-label="打开GitHub项目主页">',
         '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2.01c-3.2.7-3.87-1.54-3.87-1.54-.53-1.34-1.28-1.7-1.28-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.56-.29-5.26-1.28-5.26-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.18 1.18a11.06 11.06 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.77.12 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.4-5.27 5.68.42.36.78 1.08.78 2.18v3.23c0 .31.21.67.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"></path></svg>',
         '</a>',
+        '<button class="fastuooc-auto-player-theme" data-action="theme" type="button" title="切换界面主题" aria-label="切换界面主题">',
+        '<svg data-mode="system" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"></rect><path d="M8 21h8m-4-4v4"></path></svg>',
+        '<svg data-mode="light" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"></path></svg>',
+        '<svg data-mode="dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.1A8.5 8.5 0 0 1 9.9 3.5 8.5 8.5 0 1 0 20.5 14.1Z"></path></svg>',
+        '</button>',
         '<button class="fastuooc-auto-player-collapse" data-action="collapse" title="折叠控制面板" aria-label="折叠控制面板"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"></path></svg></button>',
         '</div>',
         '</div>',
@@ -2462,9 +2480,6 @@
         '</div>',
         '<button class="fastuooc-auto-discussion-toggle" data-action="discussion-toggle" title="在综合讨论页开始或停止自动讨论">开始自动讨论</button>',
         '</div>',
-        '<button class="fastuooc-auto-player-theme" data-action="theme" title="切换界面主题：跟随系统、浅色、深色" aria-label="切换界面主题">',
-        '<span>界面主题</span><span class="fastuooc-auto-player-theme-value"></span>',
-        '</button>',
         '</div>',
         '</div>',
       ].join('');
@@ -2479,6 +2494,19 @@
         const discussionUnlimited = box.querySelector('[data-action="discussion-unlimited"]');
         const discussionToggle = box.querySelector('[data-action="discussion-toggle"]');
         const discussionSummary = box.querySelector('[data-role="discussion-summary"]');
+        const controlPage = getControlPage();
+        [enabled, next, mute, background].forEach((button) => { button.hidden = !controlPage.playback; });
+        box.querySelector('[data-role="state"]').hidden = !controlPage.playback;
+        box.querySelector('.fastuooc-auto-player-export').hidden = !controlPage.quiz;
+        box.querySelector('.fastuooc-auto-player-ai-row').hidden = !controlPage.quiz;
+        box.querySelector('.fastuooc-auto-discussion').hidden = !controlPage.discussion;
+        if (!controlPage.quiz) {
+          const aiSettings = document.getElementById('fastuooc-ai-settings');
+          if (aiSettings) aiSettings.hidden = true;
+        }
+        if (!controlPage.discussion && state.discussion.running) {
+          stopDiscussion('已离开综合讨论，自动讨论已停止');
+        }
         const masterEnabled = state.config.enabled;
         const themeMode = ['system', 'light', 'dark'].includes(state.config.theme) ? state.config.theme : 'system';
         const themeLabel = themeMode === 'system' ? '跟随系统' : themeMode === 'light' ? '浅色' : '深色';
@@ -2504,8 +2532,8 @@
         discussionSummary.textContent = state.discussion.running
           ? state.discussion.completed + '/' + (state.config.discussionUnlimited ? '∞' : state.discussion.target) + ' · ' + discussionPhase
           : discussionPhase;
-        theme.querySelector('.fastuooc-auto-player-theme-value').textContent = themeLabel;
-        theme.setAttribute('aria-label', `切换界面主题，当前为${themeLabel}`);
+        theme.title = `切换界面主题，当前为${themeLabel}`;
+        theme.setAttribute('aria-label', theme.title);
         const discussionDetail = state.discussion.running
           ? '自动讨论第' + (state.discussion.completed + 1) + '次' + (state.discussion.lastPage ? ' · 第' + state.discussion.lastPage + '页' : '')
           : '自动讨论未运行';
@@ -2615,11 +2643,15 @@
         state.attemptedSources.clear();
         state.intendedPlayback = false;
         state.navigating = false;
+        refreshControls();
       }
       scan();
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    window.addEventListener('hashchange', () => setTimeout(scan, 100));
+    window.addEventListener('hashchange', () => setTimeout(() => {
+      refreshControls();
+      scan();
+    }, 100));
     setInterval(scan, 800);
   }
 
