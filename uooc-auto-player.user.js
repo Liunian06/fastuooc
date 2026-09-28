@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.7.2
+// @version      0.7.9
 // @description  自动控制UOOC视频播放、课程讨论和题目导出，并提供仅供参考的AI选项分析。
 // @author       Liunian06
 // @license      MIT
@@ -30,7 +30,7 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.7.2';
+  const SCRIPT_VERSION = '0.7.9';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const DEFAULT_CONFIG = Object.freeze({
@@ -50,6 +50,8 @@
     discussionUnlimited: false,
   });
   const AI_MAX_CONCURRENCY = 10;
+  const AI_VISION_MAX_CONCURRENCY = 5;
+  const QUIZ_IMAGE_MAX_CONCURRENCY = 10;
 
   const state = {
     config: loadConfig(),
@@ -67,7 +69,8 @@
     patchedVideoService: null,
     unitSourcePromises: new WeakMap(),
     catalogRequestCount: 0,
-    aiQueue: { active: 0, pending: [] },
+    aiQueue: { active: 0, visionActive: 0, pending: [] },
+    quizImageQueue: { active: 0, pending: [] },
     aiResults: new WeakMap(),
     aiRunning: false,
     discussion: {
@@ -716,15 +719,26 @@
     return documents;
   }
 
-  function textFromElement(element) {
+  function textFromElement(element, images, imagePrefix = '图片') {
     if (!element) return '';
     const clone = element.cloneNode(true);
     const ownerDocument = element.ownerDocument || document;
+    const originalImages = images ? Array.from(element.querySelectorAll('img')) : [];
     clone.querySelectorAll('script,style,input,button,textarea,select').forEach((node) => node.remove());
     clone.querySelectorAll('br').forEach((node) => node.replaceWith(ownerDocument.createTextNode('\n')));
-    clone.querySelectorAll('img').forEach((image) => {
-      const label = image.getAttribute('alt') || image.getAttribute('title') || image.getAttribute('src') || '图片';
-      image.replaceWith(ownerDocument.createTextNode('[图片: ' + label + ']'));
+    clone.querySelectorAll('img').forEach((image, index) => {
+      if (images) {
+        const original = originalImages[index];
+        const source = original && (original.currentSrc || original.getAttribute('src') || original.getAttribute('data-src')) || '';
+        const label = imagePrefix + (index + 1);
+        let url = '';
+        try { if (source) url = new URL(source, ownerDocument.baseURI).href; } catch (_) {}
+        images.push({ label, url });
+        image.replaceWith(ownerDocument.createTextNode('[' + label + ']'));
+      } else {
+        const label = image.getAttribute('alt') || image.getAttribute('title') || image.getAttribute('src') || '图片';
+        image.replaceWith(ownerDocument.createTextNode('[图片: ' + label + ']'));
+      }
     });
     return (clone.textContent || '')
       .replace(/\u00a0/g, ' ')
@@ -760,18 +774,23 @@
       const options = Array.from(container.querySelectorAll('.ti-a')).map((label, optionIndex) => {
         const rawLabel = textFromElement(label.querySelector('.ti-a-i'));
         const letterMatch = rawLabel.match(/[A-Z]/i);
+        const optionLabel = (letterMatch ? letterMatch[0] : 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[optionIndex] || String(optionIndex + 1)).toUpperCase();
+        const images = [];
         return {
-          label: (letterMatch ? letterMatch[0] : 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[optionIndex] || String(optionIndex + 1)).toUpperCase(),
-          text: textFromElement(label.querySelector('.ti-a-c') || label),
+          label: optionLabel,
+          text: textFromElement(label.querySelector('.ti-a-c') || label, images, '选项' + optionLabel + '图片'),
+          images,
         };
       }).filter((option) => option.text);
       const rawType = typeNode ? textFromElement(typeNode).replace(/\s*\(共[\s\S]*$/, '').trim() : '';
       const quizType = normalizeQuizType(rawType, container, options);
+      const images = [];
       return {
         number,
         type: quizType.label,
         isMultiple: quizType.multiple,
-        question: textFromElement(container.querySelector('.ti-q-c')),
+        question: textFromElement(container.querySelector('.ti-q-c'), images, '题目图片'),
+        images,
         options,
         score: textFromElement(container.querySelector('.scores')),
         id: (container.querySelector('.index') || {}).id || (container.querySelector('input[name]') || {}).name || '',
@@ -856,17 +875,20 @@
     return raw + '/v1/chat/completions';
   }
 
-  function enqueueAI(task, onStart) {
+  function enqueueAI(task, onStart, vision = false) {
     return new Promise((resolve, reject) => {
-      state.aiQueue.pending.push({ task, onStart, resolve, reject });
+      state.aiQueue.pending.push({ task, onStart, vision, resolve, reject });
       pumpAIQueue();
     });
   }
 
   function pumpAIQueue() {
     while (state.aiQueue.active < AI_MAX_CONCURRENCY && state.aiQueue.pending.length) {
-      const item = state.aiQueue.pending.shift();
+      const index = state.aiQueue.pending.findIndex((item) => !item.vision || state.aiQueue.visionActive < AI_VISION_MAX_CONCURRENCY);
+      if (index < 0) break;
+      const [item] = state.aiQueue.pending.splice(index, 1);
       state.aiQueue.active += 1;
+      if (item.vision) state.aiQueue.visionActive += 1;
       Promise.resolve()
         .then(() => {
           if (typeof item.onStart === 'function') item.onStart();
@@ -875,6 +897,7 @@
         .then(item.resolve, item.reject)
         .finally(() => {
           state.aiQueue.active -= 1;
+          if (item.vision) state.aiQueue.visionActive -= 1;
           pumpAIQueue();
         });
     }
@@ -882,6 +905,7 @@
 
   function requestAICompletion(messages, onStart) {
     const endpoint = getAIEndpoint();
+    const hasImages = messages.some((message) => Array.isArray(message.content));
     if (!endpoint) return Promise.reject(new Error('未配置AI接口地址'));
     if (!state.config.aiApiKey) return Promise.reject(new Error('未配置AI API Key'));
     if (!state.config.aiModel) return Promise.reject(new Error('未配置AI模型名称'));
@@ -892,7 +916,9 @@
       max_tokens: 50,
     });
     return enqueueAI(() => new Promise((resolve, reject) => {
-      const timeout = Math.max(5000, Number(state.config.aiTimeout) || 45000);
+      const configuredTimeout = Math.max(5000, Number(state.config.aiTimeout) || 45000);
+      const timeout = hasImages ? Math.max(120000, configuredTimeout) : configuredTimeout;
+      const timeoutError = () => new Error(hasImages ? '图片已读取，视觉AI请求超时（请检查接口或模型的图片输入支持）' : 'AI请求超时');
       let settled = false;
       const finish = (callback, value) => {
         if (settled) return;
@@ -900,7 +926,7 @@
         clearTimeout(timer);
         callback(value);
       };
-      const timer = setTimeout(() => finish(reject, new Error('AI请求超时')), timeout);
+      const timer = setTimeout(() => finish(reject, timeoutError()), timeout);
       if (typeof GM_xmlhttpRequest !== 'function') {
         finish(reject, new Error('当前脚本管理器不支持GM_xmlhttpRequest'));
         return;
@@ -916,7 +942,7 @@
         timeout,
         onload: (response) => {
           if (response.status < 200 || response.status >= 300) {
-            finish(reject, new Error('AI接口返回HTTP ' + response.status));
+            finish(reject, new Error('AI接口返回HTTP ' + response.status + (hasImages ? '（请确认接口和模型支持图片输入）' : '')));
             return;
           }
           try {
@@ -932,9 +958,136 @@
           }
         },
         onerror: () => finish(reject, new Error('AI接口网络请求失败')),
-        ontimeout: () => finish(reject, new Error('AI请求超时')),
+        ontimeout: () => finish(reject, timeoutError()),
       });
-    }), onStart);
+    }), onStart, hasImages);
+  }
+
+  function enqueueQuizImage(task) {
+    return new Promise((resolve, reject) => {
+      state.quizImageQueue.pending.push({ task, resolve, reject });
+      pumpQuizImageQueue();
+    });
+  }
+
+  function pumpQuizImageQueue() {
+    while (state.quizImageQueue.active < QUIZ_IMAGE_MAX_CONCURRENCY && state.quizImageQueue.pending.length) {
+      const item = state.quizImageQueue.pending.shift();
+      state.quizImageQueue.active += 1;
+      Promise.resolve()
+        .then(item.task)
+        .then(item.resolve, item.reject)
+        .finally(() => {
+          state.quizImageQueue.active -= 1;
+          pumpQuizImageQueue();
+        });
+    }
+  }
+
+  function requestQuizImageBlob(url) {
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      return Promise.reject(new Error('脚本管理器不支持读取跨域题目图片'));
+    }
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        responseType: 'blob',
+        timeout: Math.max(5000, Number(state.config.aiTimeout) || 45000),
+        onload: (response) => {
+          if (response.status < 200 || response.status >= 300 || !response.response) {
+            reject(new Error('题目图片下载失败（HTTP ' + response.status + '）'));
+            return;
+          }
+          resolve(response.response);
+        },
+        onerror: () => reject(new Error('题目图片下载失败')),
+        ontimeout: () => reject(new Error('题目图片下载超时')),
+      });
+    });
+  }
+
+  async function getQuizImageMime(blob) {
+    const bytes = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+    if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+        bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return 'image/png';
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+    if (bytes.length >= 6 && String.fromCharCode(...bytes.slice(0, 6)).match(/^GIF8[79]a$/)) return 'image/gif';
+    if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' &&
+        String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp';
+    throw new Error('题目图片格式不支持或返回的不是图片');
+  }
+
+  async function quizGifFirstFrame(blob) {
+    if (typeof createImageBitmap !== 'function') throw new Error('当前浏览器不支持读取GIF首帧');
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(blob.type === 'image/gif' ? blob : new Blob([blob], { type: 'image/gif' }));
+      if (!bitmap.width || !bitmap.height || bitmap.width * bitmap.height > 16 * 1024 * 1024) {
+        throw new Error('题目GIF图片尺寸不支持');
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext('2d').drawImage(bitmap, 0, 0);
+      return await new Promise((resolve, reject) => {
+        canvas.toBlob((result) => result ? resolve(result) : reject(new Error('题目GIF首帧转换失败')), 'image/png');
+      });
+    } finally {
+      if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+    }
+  }
+
+  async function quizImageDataUrl(url) {
+    if (!url) throw new Error('题目图片缺少地址');
+    const source = new URL(url, location.href);
+    if (!['http:', 'https:', 'data:', 'blob:'].includes(source.protocol)) {
+      throw new Error('题目图片地址格式不支持');
+    }
+    let blob;
+    if (source.protocol === 'data:' || source.protocol === 'blob:' || source.origin === location.origin) {
+      try {
+        const response = await fetch(source.href, { credentials: 'include' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        blob = await response.blob();
+      } catch (error) {
+        if (source.protocol !== 'http:' && source.protocol !== 'https:') throw new Error('题目图片读取失败');
+        blob = await requestQuizImageBlob(source.href);
+      }
+    } else {
+      blob = await requestQuizImageBlob(source.href);
+    }
+    if (!blob || typeof blob.size !== 'number' || !blob.size || blob.size > 5 * 1024 * 1024) {
+      throw new Error('题目图片为空或超过5MB');
+    }
+    const mime = await getQuizImageMime(blob);
+    const image = mime === 'image/gif' ? await quizGifFirstFrame(blob) :
+      blob.type === mime ? blob : new Blob([blob], { type: mime });
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('题目图片编码失败'));
+      reader.readAsDataURL(image);
+    });
+  }
+
+  async function buildAIQuestionMessages(item) {
+    const images = [...(item.images || []), ...item.options.flatMap((option) => option.images || [])];
+    const prompt = buildAIQuestionPrompt(item);
+    if (!images.length) return [{ role: 'user', content: prompt }];
+    if (images.length > 16) throw new Error('单题图片超过16张，未发送不完整题目');
+    renderAIStatus(item.element, 'AI参考：正在读取图片…', 'is-loading');
+    const cache = new Map();
+    const urls = await Promise.all(images.map((image) => {
+      if (!cache.has(image.url)) cache.set(image.url, enqueueQuizImage(() => quizImageDataUrl(image.url)));
+      return cache.get(image.url);
+    }));
+    const parts = [{ type: 'text', text: prompt }];
+    images.forEach((image, index) => {
+      parts.push({ type: 'text', text: image.label });
+      parts.push({ type: 'image_url', image_url: { url: urls[index] } });
+    });
+    return [{ role: 'user', content: parts }];
   }
 
   function buildAIQuestionPrompt(item) {
@@ -944,6 +1097,7 @@
       '你是严谨的选择题分析助手。请独立判断下面题目的最可能正确答案。',
       '先判断知识类型：数学、物理、化学、生物等需要推导或计算的题目，请直接进行严谨分析；历史、地理、政治、经济、法律、学校信息、机构信息、时事和其他事实性题目，如果当前模型或接口实际提供联网搜索/浏览工具，必须先调用该工具核验关键事实。',
       '只有在确实调用了可用的联网搜索工具后，才可以声称完成了搜索；如果接口没有搜索工具，不要伪装已经搜索过，并根据已有知识谨慎判断。无法可靠判断时只输出“无法确定”，脚本会将其视为无效回答。',
+      '题目或选项中的[题目图片1]、[选项A图片1]等标记对应消息后附带的同名图片。请读取图片中的文字、公式和图形，不要依据文件名猜测；若模型无法识别图片，只输出“无法确定”。',
       '题型：' + typeLabel,
       item.isMultiple
         ? '输出规则：这是多选题，只输出所有最可能正确的选项标签，按题目顺序用英文逗号分隔，例如A,C。不要输出解释、标点前缀、Markdown或其他文字。'
@@ -994,7 +1148,7 @@
   }
 
   async function analyzeQuizQuestion(item) {
-    const messages = [{ role: 'user', content: buildAIQuestionPrompt(item) }];
+    const messages = await buildAIQuestionMessages(item);
     let started = false;
     const markStarted = () => {
       if (started) return;
@@ -1002,10 +1156,12 @@
       renderAIAnalyzing(item.element);
     };
     const firstRound = await Promise.all([1, 2, 3].map(() => requestAICompletion(messages, markStarted).catch((error) => ({ error }))));
+    if (firstRound.every((result) => result && result.error)) throw firstRound[0].error;
     let answers = firstRound.map((result) => result && result.error ? [] : normalizeAIOptions(result, item));
     const firstVote = countAIVotes(answers, item);
     if (!firstVote.tied && firstVote.options.length && firstVote.votes === 3) return firstVote;
     const extraRound = await Promise.all([1, 2].map(() => requestAICompletion(messages, markStarted).catch((error) => ({ error }))));
+    if (firstRound.concat(extraRound).every((result) => result && result.error)) throw firstRound[0].error;
     answers = answers.concat(extraRound.map((result) => result && result.error ? [] : normalizeAIOptions(result, item)));
     return countAIVotes(answers, item);
   }
@@ -1099,7 +1255,7 @@
         renderAIReference(item.element, vote);
       } catch (error) {
         logError('AI题目分析失败', item.number, error);
-        renderAIReference(item.element, { options: [], votes: 0, total: 0, tied: false });
+        renderAIReference(item.element, { options: [], votes: 0, total: 0, tied: false, message: 'AI参考：' + (error && error.message || '分析失败') });
       } finally {
         completed += 1;
         if (completed === questions.length) notify('AI参考分析完成，共' + questions.length + '道选择题');
@@ -2345,19 +2501,47 @@
   }
 
   function scan() {
-    patchBackgroundPausePolicy();
     if (enforceMasterConfig()) saveConfig();
-    const video = findNativeVideo();
+    const controlPage = getControlPage();
+    if (controlPage.playback) patchBackgroundPausePolicy();
+    const controlPageKey = [controlPage.playback, controlPage.quiz, controlPage.discussion].join(':');
+    if (state.controlPageKey !== controlPageKey) {
+      state.controlPageKey = controlPageKey;
+      refreshControls();
+    }
+    const video = controlPage.playback && findNativeVideo();
     if (video) bindVideo(video);
+  }
+
+  function hasVisibleQuizQuestions(doc) {
+    return Array.from(doc.querySelectorAll('.queContainer .ti-q-c'))
+      .some((node) => node.getClientRects().length > 0);
+  }
+
+  function hasLearnQuiz() {
+    if (hasVisibleQuizQuestions(document)) return true;
+    return Array.from(document.querySelectorAll('iframe')).some((frame) => {
+      if (!frame.getClientRects().length) return false;
+      try {
+        if (frame.contentDocument && hasVisibleQuizQuestions(frame.contentDocument)) return true;
+      } catch (_) {}
+      try {
+        return /^\/exam(?:\/|$)/i.test(new URL(frame.src, location.href).pathname);
+      } catch (_) {
+        return false;
+      }
+    });
   }
 
   function getControlPage() {
     const isCoursePage = /^\/home\/course\/(?:new\/)?\d+(?:\/|$)/i.test(location.pathname);
+    const isLearnPage = /^\/home\/learn(?:\/|$)/i.test(location.pathname);
     const section = location.hash.replace(/^#\/?/, '').split('/')[0].toLowerCase();
+    const learnQuiz = isLearnPage && (['test', 'exam'].includes(section) || hasLearnQuiz());
     return {
-      playback: /^\/home\/learn(?:\/|$)/i.test(location.pathname) && !['test', 'exam'].includes(section),
+      playback: isLearnPage && !learnQuiz,
       quiz: /^\/exam(?:\/|$)/i.test(location.pathname) ||
-        (isCoursePage && (section === 'test' || section === 'exam')),
+        learnQuiz || (isCoursePage && (section === 'test' || section === 'exam')),
       discussion: isCoursePage && ['discuss', 'discusscom', 'discussdetail'].includes(section),
     };
   }
@@ -2666,10 +2850,14 @@
       videoJsAvailable: Boolean(pageWindow.videojs),
       config: getDiagnosticSnapshot().config,
     });
-    installControls();
-    startBackgroundPlaybackGuard();
-    observe();
-    scan();
+    const initialize = () => {
+      installControls();
+      startBackgroundPlaybackGuard();
+      observe();
+      scan();
+    };
+    if (document.documentElement) initialize();
+    else document.addEventListener('DOMContentLoaded', initialize, { once: true });
   }
 
   start();
