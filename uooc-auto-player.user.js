@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.7.9
-// @description  自动控制UOOC视频播放、课程讨论和题目导出，并提供仅供参考的AI选项分析。
+// @version      0.8.5
+// @description  自动控制UOOC视频播放、课程讨论和题目导出，支持测验/作业/考试长截图与新版考核批量截图，并提供仅供参考的AI选项分析。
+// @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @author       Liunian06
 // @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
@@ -22,6 +23,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_download
 // @grant        unsafeWindow
 // @connect      *
 // ==/UserScript==
@@ -30,9 +32,13 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.7.9';
+  const SCRIPT_VERSION = '0.8.5';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
+  const SCREENSHOT_SCALE_DEFAULT = 1.5;
+  const SCREENSHOT_SCALE_MIN = 0.5;
+  const SCREENSHOT_SCALE_MAX = 4;
+  const ASSESSMENT_SELECTION_KEY_PREFIX = 'fastuooc:assessment-batch:selection:';
   const DEFAULT_CONFIG = Object.freeze({
     enabled: true,
     autoPlay: true,
@@ -48,6 +54,8 @@
     aiTimeout: 45000,
     discussionCount: 1,
     discussionUnlimited: false,
+    screenshotScale: SCREENSHOT_SCALE_DEFAULT,
+    assessmentBatchMode: 'visible',
   });
   const AI_MAX_CONCURRENCY = 10;
   const AI_VISION_MAX_CONCURRENCY = 5;
@@ -73,6 +81,25 @@
     quizImageQueue: { active: 0, pending: [] },
     aiResults: new WeakMap(),
     aiRunning: false,
+    screenshotRunning: false,
+    assessmentBatch: {
+      active: false,
+      route: '',
+      runId: 0,
+      phase: 'idle',
+      items: [],
+      queue: [],
+      index: 0,
+      completed: 0,
+      failures: [],
+      frame: null,
+      tab: null,
+      token: '',
+      expectedUrl: '',
+      requestId: '',
+      requested: false,
+      result: null,
+    },
     discussion: {
       running: false,
       phase: 'idle',
@@ -95,6 +122,11 @@
       delete stored.aiApiKey;
       if (legacyApiKey) localStorage.setItem(CONFIG_KEY, JSON.stringify(stored));
       const config = Object.assign({}, DEFAULT_CONFIG, stored);
+      const screenshotScale = Number(config.screenshotScale);
+      config.screenshotScale = config.screenshotScale != null && config.screenshotScale !== '' && Number.isFinite(screenshotScale)
+        ? Math.min(SCREENSHOT_SCALE_MAX, Math.max(SCREENSHOT_SCALE_MIN, screenshotScale))
+        : SCREENSHOT_SCALE_DEFAULT;
+      config.assessmentBatchMode = config.assessmentBatchMode === 'hidden' ? 'hidden' : 'visible';
       config.speed = DEFAULT_CONFIG.speed;
       try {
         config.aiApiKey = (typeof GM_getValue === 'function' && GM_getValue('fastuooc:ai-api-key', '')) || legacyApiKey;
@@ -291,6 +323,7 @@
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       if (runId != null) assertDiscussionRun(runId);
+      if (options.isCancelled && options.isCancelled()) return null;
       try {
         const value = await predicate();
         if (value) return value;
@@ -811,6 +844,721 @@
       }
     }
     return null;
+  }
+
+  async function waitForAssessmentPageReady(doc, isCancelled) {
+    let stableSignature = '';
+    let stableCount = 0;
+    let fontsReady = !doc.fonts || doc.fonts.status === 'loaded';
+    if (!fontsReady && doc.fonts && doc.fonts.ready) {
+      doc.fonts.ready.then(() => { fontsReady = true; }).catch(() => { fontsReady = true; });
+    }
+    return waitForCondition(() => {
+      if (isCancelled && isCancelled()) return null;
+      if (!doc || !doc.documentElement || doc.readyState !== 'complete' || !fontsReady) return null;
+      const target = getQuizScreenshotTarget([doc]);
+      if (!target) return null;
+      const images = Array.from(target.querySelectorAll('img'));
+      if (images.some((image) => !image.complete)) return null;
+      const rect = target.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      const signature = [images.length, target.querySelectorAll('.queContainer').length,
+        Math.round(rect.width), Math.round(rect.height), target.scrollHeight].join(':');
+      if (signature === stableSignature) stableCount += 1;
+      else { stableSignature = signature; stableCount = 1; }
+      return stableCount >= 3 ? target : null;
+    }, { timeout: 120000, interval: 400, isCancelled });
+  }
+
+  function getQuizScreenshotTarget(documents = getQuizDocuments()) {
+    const candidates = [];
+    documents.forEach((doc) => {
+      ['.testPaper', '.testPaperShow'].forEach((selector) => {
+        Array.from(doc.querySelectorAll(selector)).forEach((node) => {
+          const rect = node.getBoundingClientRect();
+          if (!rect.width || !rect.height || !node.getClientRects().length) return;
+          const questionCount = node.querySelectorAll('.queContainer').length;
+          candidates.push({
+            node,
+            score: questionCount * 1000000 + Math.round(rect.width * rect.height),
+          });
+        });
+      });
+    });
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates.length ? candidates[0].node : null;
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('读取截图图片失败'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function requestScreenshotImage(url) {
+    if (/^data:/i.test(url)) return Promise.resolve(url);
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          responseType: 'blob',
+          timeout: 15000,
+          onload(response) {
+            if (response.status < 200 || response.status >= 400 || !response.response) {
+              reject(new Error('图片请求失败：HTTP ' + response.status));
+              return;
+            }
+            blobToDataUrl(response.response).then(resolve, reject);
+          },
+          ontimeout() { reject(new Error('图片请求超时')); },
+          onerror() { reject(new Error('图片请求失败')); },
+        });
+      });
+    }
+    return fetch(url, { credentials: 'include' })
+      .then((response) => {
+        if (!response.ok) throw new Error('图片请求失败：HTTP ' + response.status);
+        return response.blob();
+      })
+      .then(blobToDataUrl);
+  }
+
+  async function collectScreenshotImageData(target) {
+    const urls = new Set();
+    const ownerDocument = target.ownerDocument || document;
+    target.querySelectorAll('img').forEach((image) => {
+      const source = image.currentSrc || image.getAttribute('src') || image.getAttribute('data-src') || '';
+      if (!source || /^blob:/i.test(source)) return;
+      try {
+        urls.add(new URL(source, ownerDocument.baseURI || location.href).href);
+      } catch (_) {}
+    });
+    const pending = Array.from(urls);
+    const entries = [];
+    const worker = async () => {
+      while (pending.length) {
+        const url = pending.shift();
+        try {
+          entries.push([url, await requestScreenshotImage(url)]);
+        } catch (error) {
+          logWarning('长截图图片转码失败，将保留原图', { url: sanitizeUrlForLog(url), error });
+          entries.push([url, '']);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(QUIZ_IMAGE_MAX_CONCURRENCY, pending.length) }, worker));
+    return new Map(entries.filter((entry) => entry[1]));
+  }
+
+  function downloadBlobWithAnchor(filename, blob, url) {
+    return new Promise((resolve) => {
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.style.display = 'none';
+      (document.body || document.documentElement).appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(resolve, 800);
+    });
+  }
+
+  function downloadBlob(filename, blob) {
+    if (!blob) return Promise.reject(new Error('截图数据为空'));
+    const url = URL.createObjectURL(blob);
+    const revoke = () => {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+    };
+    if (typeof GM_download === 'function') {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          revoke();
+          error ? reject(error) : resolve();
+        };
+        const timeout = setTimeout(() => finish(new Error('下载接口超时')), 180000);
+        try {
+          GM_download({
+            url,
+            name: filename,
+            saveAs: false,
+            onload: () => finish(),
+            onerror: (error) => {
+              logWarning('GM_download失败，回退浏览器下载', { filename, error });
+              downloadBlobWithAnchor(filename, blob, url).then(() => finish(), finish);
+            },
+            ontimeout: () => finish(new Error('下载接口超时')),
+          });
+        } catch (error) {
+          logWarning('调用GM_download失败，回退浏览器下载', { filename, error });
+          downloadBlobWithAnchor(filename, blob, url).then(() => finish(), finish);
+        }
+      });
+    }
+    return downloadBlobWithAnchor(filename, blob, url).finally(revoke);
+  }
+
+  async function renderQuizScreenshot(target, message = true, scale = state.config.screenshotScale) {
+    const renderer = typeof html2canvas === 'function' ? html2canvas : pageWindow.html2canvas;
+    if (typeof renderer !== 'function') throw new Error('长截图组件未加载，请刷新页面后重试');
+    const marker = 'data-fastuooc-screenshot-target';
+    let imageData = null;
+    let canvas = null;
+    target.setAttribute(marker, '');
+    try {
+      if (message) notify('正在准备长截图图片…', 5000);
+      imageData = await collectScreenshotImageData(target);
+      const ownerWindow = target.ownerDocument.defaultView || window;
+      if (message) notify('正在生成长截图，请稍候…', 5000);
+      canvas = await renderer(target, {
+        backgroundColor: null,
+        useCORS: true,
+        allowTaint: false,
+        imageTimeout: 15000,
+        logging: false,
+        scale,
+        scrollX: ownerWindow.scrollX || 0,
+        scrollY: ownerWindow.scrollY || 0,
+        onclone(clonedDocument) {
+          const style = clonedDocument.createElement('style');
+          style.textContent = '*{animation:none!important;transition:none!important;caret-color:transparent!important}';
+          (clonedDocument.head || clonedDocument.documentElement).appendChild(style);
+          const clonedTarget = clonedDocument.querySelector('[' + marker + ']');
+          if (!clonedTarget) return;
+          clonedTarget.querySelectorAll('img').forEach((image) => {
+            const source = image.currentSrc || image.getAttribute('src') || image.getAttribute('data-src') || '';
+            let absoluteUrl = '';
+            try {
+              absoluteUrl = new URL(source, clonedDocument.baseURI || location.href).href;
+            } catch (_) {}
+            const dataUrl = imageData.get(absoluteUrl);
+            if (dataUrl) {
+              image.removeAttribute('srcset');
+              image.removeAttribute('data-src');
+              image.src = dataUrl;
+            }
+          });
+        },
+      });
+      const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((value) => value ? resolve(value) : reject(new Error('浏览器无法生成PNG图片')), 'image/png');
+      });
+      const titleNode = target.ownerDocument.querySelector('.testPaper-Top');
+      const title = textFromElement(titleNode) || 'UOOC试卷';
+      return { blob, title };
+    } finally {
+      target.removeAttribute(marker);
+      if (imageData) imageData.clear();
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    }
+  }
+
+  async function captureQuizScreenshot() {
+    if (state.screenshotRunning) return false;
+    const target = getQuizScreenshotTarget();
+    if (!target) {
+      notify('当前页面未找到可截图的试卷内容');
+      return false;
+    }
+    state.screenshotRunning = true;
+    refreshControls();
+    try {
+      const result = await renderQuizScreenshot(target);
+      const safeTitle = result.title.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '-').slice(0, 80) || 'uooc-paper';
+      const stamp = new Date().toISOString().slice(0, 10);
+      await downloadBlob(safeTitle + '-长截图-' + stamp + '.png', result.blob);
+      result.blob = null;
+      notify('长截图已下载');
+      return true;
+    } catch (error) {
+      logError('长截图失败', error);
+      notify('长截图失败：' + (error && error.message ? error.message : '页面过长或图片无法读取'));
+      return false;
+    } finally {
+      state.screenshotRunning = false;
+      refreshControls();
+    }
+  }
+
+  function isNewAssessmentPage() {
+    const isNewCourse = /^\/home\/course\/new\/\d+(?:\/|$)/i.test(location.pathname);
+    const section = location.hash.replace(/^#\/?/, '').split('/')[0].toLowerCase();
+    return isNewCourse && section === 'assessment';
+  }
+
+  function getAssessmentBatchItems() {
+    const seen = new Set();
+    return Array.from(document.querySelectorAll('a[href]')).map((link) => {
+      let url;
+      try { url = new URL(link.href, location.href); } catch (_) { return null; }
+      if (!/^\/exam\/paper\/?$/i.test(url.pathname) || !url.searchParams.get('tid')) return null;
+      const key = url.origin + url.pathname + '?cid=' + (url.searchParams.get('cid') || '') + '&tid=' + url.searchParams.get('tid');
+      if (seen.has(key)) return null;
+      seen.add(key);
+      const row = link.closest('tr');
+      const title = row && textFromElement(row.querySelector('td')) || textFromElement(link) || 'UOOC考核项目';
+      return { key, url: url.href, title: title.replace(/\s+/g, ' ').trim(), selected: true, done: false, failed: '' };
+    }).filter(Boolean);
+  }
+
+  // 按课程保存批量截图的勾选状态和已截图记录，便于下次继续
+  function getAssessmentSelectionStorageKey() {
+    const match = location.pathname.match(/^\/home\/course\/new\/(\d+)/i);
+    return ASSESSMENT_SELECTION_KEY_PREFIX + (match ? match[1] : 'default');
+  }
+
+  function loadAssessmentSelection() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(getAssessmentSelectionStorageKey()) || '{}');
+      return {
+        selected: stored.selected && typeof stored.selected === 'object' ? stored.selected : {},
+        done: stored.done && typeof stored.done === 'object' ? stored.done : {},
+      };
+    } catch (_) {
+      return { selected: {}, done: {} };
+    }
+  }
+
+  function saveAssessmentSelection() {
+    const stored = loadAssessmentSelection();
+    state.assessmentBatch.items.forEach((item) => {
+      stored.selected[item.key] = Boolean(item.selected);
+      if (item.done) stored.done[item.key] = true;
+      else delete stored.done[item.key];
+    });
+    try {
+      localStorage.setItem(getAssessmentSelectionStorageKey(), JSON.stringify(stored));
+    } catch (error) {
+      logWarning('保存批量截图勾选状态失败', error);
+    }
+  }
+
+  function applyAssessmentSelection(items) {
+    const stored = loadAssessmentSelection();
+    items.forEach((item) => {
+      item.done = Boolean(stored.done[item.key]);
+      // 新发现的项目默认勾选，已截图的默认不勾选
+      item.selected = Object.prototype.hasOwnProperty.call(stored.selected, item.key)
+        ? Boolean(stored.selected[item.key])
+        : !item.done;
+    });
+    return items;
+  }
+
+  function setAssessmentSelection(mode) {
+    const batch = state.assessmentBatch;
+    if (batch.active || !batch.items.length) return;
+    batch.items.forEach((item) => {
+      item.selected = mode === 'all' ? true : mode === 'pending' ? !item.done : false;
+    });
+    saveAssessmentSelection();
+    refreshControls();
+  }
+
+  function getAssessmentBatchSummary() {
+    const batch = state.assessmentBatch;
+    const total = batch.queue.length;
+    if (batch.active && batch.phase === 'discovering') return '正在识别可截图项目…';
+    if (batch.active) return '正在截图 ' + Math.min(batch.index + 1, total) + '/' + total;
+    if (batch.phase === 'stopped') return '已停止：成功 ' + batch.completed + ' 个，失败 ' + batch.failures.length + ' 个';
+    if (batch.phase === 'error') return '批量截图异常，请重试';
+    if (batch.phase === 'empty') return '未找到可用项目，可重试';
+    if (batch.phase === 'complete') return '已完成 ' + batch.completed + '/' + total + '，失败 ' + batch.failures.length + ' 个';
+    if (batch.items.length) {
+      const selected = batch.items.filter((item) => item.selected).length;
+      const done = batch.items.filter((item) => item.done).length;
+      return '共 ' + batch.items.length + ' 个，已截图 ' + done + ' 个，已选 ' + selected + ' 个';
+    }
+    return '先识别项目，勾选后开始截图';
+  }
+
+  // 仅在项目集合变化时重建列表，其余时候就地同步勾选和状态，避免刷新打断操作
+  function renderAssessmentBatchList(container) {
+    const batch = state.assessmentBatch;
+    const signature = batch.items.map((item) => item.key).join('|');
+    if (container.dataset.signature !== signature) {
+      container.dataset.signature = signature;
+      container.textContent = '';
+      batch.items.forEach((item) => {
+        const row = document.createElement('label');
+        row.className = 'fastuooc-auto-assessment-item';
+        row.title = item.title;
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.role = 'assessment-item';
+        checkbox.dataset.key = item.key;
+        const title = document.createElement('span');
+        title.className = 'fastuooc-auto-assessment-item-title';
+        title.textContent = item.title;
+        const tag = document.createElement('em');
+        tag.className = 'fastuooc-auto-assessment-item-tag';
+        row.append(checkbox, title, tag);
+        container.appendChild(row);
+      });
+    }
+    container.hidden = !batch.items.length;
+    const byKey = new Map(batch.items.map((item) => [item.key, item]));
+    const current = batch.active && batch.phase === 'capturing' ? batch.queue[batch.index] : null;
+    container.querySelectorAll('.fastuooc-auto-assessment-item').forEach((row) => {
+      const checkbox = row.querySelector('input');
+      const item = byKey.get(checkbox.dataset.key);
+      if (!item) return;
+      checkbox.checked = Boolean(item.selected);
+      checkbox.disabled = batch.active;
+      const tag = row.querySelector('.fastuooc-auto-assessment-item-tag');
+      const label = item === current ? '截图中' : item.failed ? '失败' : item.done ? '已截图' : '';
+      tag.textContent = label;
+      tag.title = item.failed || '';
+      row.classList.toggle('is-done', item.done && !item.failed);
+      row.classList.toggle('is-failed', Boolean(item.failed));
+      row.classList.toggle('is-current', item === current);
+    });
+  }
+
+  function removeAssessmentBatchFrame() {
+    const frame = state.assessmentBatch.frame;
+    if (frame && frame.parentNode) frame.parentNode.removeChild(frame);
+    state.assessmentBatch.frame = null;
+  }
+
+  function closeAssessmentBatchTab() {
+    const batch = state.assessmentBatch;
+    const tab = batch.tab;
+    batch.tab = null;
+    batch.token = '';
+    batch.expectedUrl = '';
+    batch.requestId = '';
+    batch.result = null;
+    if (tab) {
+      try { if (!tab.closed) tab.close(); } catch (_) {}
+    }
+  }
+
+  function isAssessmentPaperUrl(actual, expected) {
+    try {
+      const left = new URL(actual);
+      const right = new URL(expected);
+      return left.origin === right.origin && /^\/exam\/paper\/?$/i.test(left.pathname) &&
+        left.searchParams.get('cid') === right.searchParams.get('cid') &&
+        left.searchParams.get('tid') === right.searchParams.get('tid');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function installAssessmentCaptureWorker() {
+    if (!/^\/exam\/paper\/?$/i.test(location.pathname) || !window.opener || !window.name.startsWith('fastuooc-batch-')) return;
+    const token = window.name.slice('fastuooc-batch-'.length);
+    let generation = 0;
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (event.source !== window.opener || !data || data.token !== token) return;
+      if (data.type === 'fastuooc-batch-cancel') {
+        generation += 1;
+        return;
+      }
+      if (data.type !== 'fastuooc-batch-capture' || !isAssessmentPaperUrl(location.href, data.url)) return;
+      const current = ++generation;
+      const cancelled = () => current !== generation;
+      const reply = (success, error = '') => {
+        try {
+          window.opener.postMessage({ type: 'fastuooc-batch-result', token, requestId: data.requestId, url: location.href, success, error }, '*');
+        } catch (_) {}
+      };
+      (async () => {
+        let result = null;
+        try {
+          const target = await waitForAssessmentPageReady(document, cancelled);
+          if (cancelled()) return;
+          if (!target) throw new Error('未找到试卷内容');
+          await sleep(1200);
+          if (cancelled()) return;
+          const scale = Math.min(SCREENSHOT_SCALE_MAX, Math.max(SCREENSHOT_SCALE_MIN, Number(data.scale) || SCREENSHOT_SCALE_DEFAULT));
+          result = await renderQuizScreenshot(target, false, scale);
+          if (cancelled()) return;
+          const safeTitle = (data.title || result.title || 'uooc-assessment')
+            .replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '-').slice(0, 80) || 'uooc-assessment';
+          await downloadBlob(safeTitle + '-长截图-' + new Date().toISOString().slice(0, 10) + '.png', result.blob);
+          result.blob = null;
+          reply(true);
+        } catch (error) {
+          if (!cancelled()) reply(false, error && error.message ? error.message : String(error));
+        } finally {
+          if (result) result.blob = null;
+        }
+      })();
+    });
+    try { window.opener.postMessage({ type: 'fastuooc-batch-ready', token, url: location.href }, '*'); } catch (_) {}
+  }
+
+  function installAssessmentBatchMessages() {
+    window.addEventListener('message', (event) => {
+      const batch = state.assessmentBatch;
+      const data = event.data;
+      if (!batch.active || !batch.tab || event.source !== batch.tab || !data || data.token !== batch.token || !batch.expectedUrl) return;
+      if (event.origin !== new URL(batch.expectedUrl).origin || !isAssessmentPaperUrl(data.url, batch.expectedUrl)) return;
+      if (data.type === 'fastuooc-batch-ready' && !batch.requested) {
+        batch.requested = true;
+        try {
+          batch.tab.postMessage({ type: 'fastuooc-batch-capture', token: batch.token,
+            requestId: batch.requestId, url: batch.expectedUrl, title: batch.queue[batch.index].title,
+            scale: state.config.screenshotScale }, event.origin);
+        } catch (error) {
+          batch.result = { success: false, error: '无法联系截图页面：' + error.message };
+        }
+      } else if (data.type === 'fastuooc-batch-result' && data.requestId === batch.requestId) {
+        batch.result = { success: Boolean(data.success), error: data.error || '' };
+      }
+    });
+  }
+
+  function stopAssessmentBatch() {
+    const batch = state.assessmentBatch;
+    if (!batch.active) return;
+    batch.runId += 1;
+    batch.active = false;
+    batch.phase = 'stopped';
+    removeAssessmentBatchFrame();
+    if (batch.tab) {
+      try { batch.tab.postMessage({ type: 'fastuooc-batch-cancel', token: batch.token }, '*'); } catch (_) {}
+      closeAssessmentBatchTab();
+    }
+    refreshControls();
+  }
+
+  function isAssessmentBatchCurrent(route, runId) {
+    const batch = state.assessmentBatch;
+    return batch.active && batch.runId === runId && location.href === route && isNewAssessmentPage();
+  }
+
+  function openAssessmentBatchTab() {
+    const batch = state.assessmentBatch;
+    if (batch.tab && !batch.tab.closed) return true;
+    const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    const tab = window.open('about:blank', 'fastuooc-batch-' + token, 'popup,width=1280,height=900');
+    if (!tab) throw new Error('浏览器阻止了新标签页，请允许当前网站打开弹出窗口后重试');
+    batch.tab = tab;
+    batch.token = token;
+    batch.expectedUrl = '';
+    batch.requestId = '';
+    batch.requested = false;
+    batch.result = null;
+    try { tab.focus(); } catch (_) {}
+    return true;
+  }
+
+  async function captureVisibleAssessmentItem(item, route, runId, index) {
+    const batch = state.assessmentBatch;
+    const tab = batch.tab;
+    if (!tab || tab.closed) throw new Error('截图标签页已关闭');
+    batch.expectedUrl = item.url;
+    batch.requestId = runId + ':' + index;
+    batch.requested = false;
+    batch.result = null;
+    tab.location.replace(item.url);
+    const outcome = await waitForCondition(() => batch.result, {
+      timeout: 120000, interval: 250,
+      isCancelled: () => !isAssessmentBatchCurrent(route, runId) || tab.closed,
+    });
+    if (!isAssessmentBatchCurrent(route, runId)) return false;
+    if (tab.closed) throw new Error('截图标签页已关闭');
+    if (!outcome) throw new Error('截图页面未响应，请确认新标签页已加载本脚本');
+    if (!outcome.success) throw new Error(outcome.error || '截图页面导出失败');
+    batch.result = null;
+    return true;
+  }
+
+  // 截图成功后记录为已截图并取消勾选，下次开始时自动跳过
+  function markAssessmentItemDone(item) {
+    state.assessmentBatch.completed += 1;
+    item.done = true;
+    item.failed = '';
+    item.selected = false;
+    saveAssessmentSelection();
+  }
+
+  async function runAssessmentBatchScreenshot(items, route, runId) {
+    const batch = state.assessmentBatch;
+    for (let index = 0; index < items.length; index += 1) {
+      if (!isAssessmentBatchCurrent(route, runId)) return;
+      batch.index = index;
+      refreshControls();
+      const item = items[index];
+      let frame = null;
+      let result = null;
+      try {
+        notify('正在截图 ' + (index + 1) + '/' + items.length + '：' + item.title, 5000);
+        if (state.config.assessmentBatchMode === 'visible') {
+          if (await captureVisibleAssessmentItem(item, route, runId, index)) markAssessmentItemDone(item);
+          continue;
+        }
+        frame = document.createElement('iframe');
+        frame.setAttribute('aria-hidden', 'true');
+        frame.style.cssText = 'position:fixed;left:-100000px;top:0;width:1280px;height:900px;border:0;opacity:1;pointer-events:none;z-index:-1;';
+        batch.frame = frame;
+        (document.body || document.documentElement).appendChild(frame);
+        frame.src = item.url;
+        const frameDocument = await waitForCondition(() => {
+          try {
+            return frame.contentDocument && frame.contentDocument.querySelector('html') ? frame.contentDocument : null;
+          } catch (_) {
+            return null;
+          }
+        }, { timeout: 30000, interval: 300, isCancelled: () => !isAssessmentBatchCurrent(route, runId) });
+        if (!isAssessmentBatchCurrent(route, runId)) return;
+        if (!frameDocument) throw new Error('考核项目页面加载超时');
+        const target = await waitForAssessmentPageReady(frameDocument, () => !isAssessmentBatchCurrent(route, runId));
+        if (!isAssessmentBatchCurrent(route, runId)) return;
+        if (!target) throw new Error('未找到试卷内容');
+        await sleep(1200);
+        if (!isAssessmentBatchCurrent(route, runId)) return;
+        result = await renderQuizScreenshot(target, false);
+        if (!isAssessmentBatchCurrent(route, runId)) return;
+        const safeTitle = (item.title || result.title || 'uooc-assessment')
+          .replace(/[\\/:*?"<>|]/g, '-')
+          .replace(/\s+/g, '-')
+          .slice(0, 80) || 'uooc-assessment';
+        const stamp = new Date().toISOString().slice(0, 10);
+        await downloadBlob(safeTitle + '-长截图-' + stamp + '.png', result.blob);
+        result.blob = null;
+        markAssessmentItemDone(item);
+      } catch (error) {
+        if (!isAssessmentBatchCurrent(route, runId)) return;
+        const message = error && error.message ? error.message : String(error);
+        item.failed = message;
+        batch.failures.push({ item, error: message });
+        logWarning('批量长截图项目失败', { item, error });
+        if (batch.tab && batch.tab.closed) {
+          stopAssessmentBatch();
+          notify('截图标签页已关闭，批量截图已停止');
+          return;
+        }
+      } finally {
+        if (result) result.blob = null;
+        if (frame) {
+          try { frame.src = 'about:blank'; } catch (_) {}
+          if (frame.parentNode) frame.parentNode.removeChild(frame);
+        }
+        if (batch.frame === frame) batch.frame = null;
+        refreshControls();
+      }
+      await sleep(300);
+    }
+    if (isAssessmentBatchCurrent(route, runId)) {
+      closeAssessmentBatchTab();
+      batch.active = false;
+      batch.phase = 'complete';
+      notify('新版考核批量截图完成：成功' + batch.completed + '个，失败' + batch.failures.length + '个', 5000);
+      refreshControls();
+    }
+  }
+
+  // 识别当前考核页的可截图项目，并恢复上次保存的勾选状态
+  function discoverAssessmentBatchItems(route, runId) {
+    return waitForCondition(() => {
+      const found = getAssessmentBatchItems();
+      return found.length ? found : null;
+    }, { timeout: 20000, interval: 500, isCancelled: () => !isAssessmentBatchCurrent(route, runId) })
+      .then((items) => (items ? applyAssessmentSelection(items) : []));
+  }
+
+  function beginAssessmentBatchRun() {
+    const batch = state.assessmentBatch;
+    closeAssessmentBatchTab();
+    batch.route = location.href;
+    batch.active = true;
+    batch.runId += 1;
+    batch.queue = [];
+    batch.index = 0;
+    batch.completed = 0;
+    batch.failures = [];
+    return { route: batch.route, runId: batch.runId };
+  }
+
+  function scanAssessmentBatchItems() {
+    if (!isNewAssessmentPage()) return;
+    const batch = state.assessmentBatch;
+    if (batch.active) return;
+    const { route, runId } = beginAssessmentBatchRun();
+    batch.phase = 'discovering';
+    notify('正在识别新版考核页面的可截图项目…', 5000);
+    refreshControls();
+    discoverAssessmentBatchItems(route, runId).then((items) => {
+      if (!isAssessmentBatchCurrent(route, runId)) return;
+      batch.active = false;
+      batch.items = items;
+      batch.phase = items.length ? 'ready' : 'empty';
+      notify(items.length ? '已识别' + items.length + '个项目，请勾选需要截图的项目' : '新版考核页面未找到可用项目');
+      refreshControls();
+    }).catch((error) => {
+      if (batch.runId !== runId) return;
+      batch.active = false;
+      batch.phase = 'error';
+      logError('识别考核项目失败', error);
+      notify('识别考核项目失败');
+      refreshControls();
+    });
+  }
+
+  function startAssessmentBatchScreenshot() {
+    if (!isNewAssessmentPage()) return;
+    const batch = state.assessmentBatch;
+    if (batch.active) return;
+    const hasList = batch.items.length > 0;
+    if (hasList && !batch.items.some((item) => item.selected)) {
+      notify('请先勾选需要截图的项目');
+      return;
+    }
+    const { route, runId } = beginAssessmentBatchRun();
+    batch.phase = hasList ? 'capturing' : 'discovering';
+    try {
+      // 显示式需在点击的同步阶段打开弹窗，避免被浏览器拦截
+      if (state.config.assessmentBatchMode === 'visible') openAssessmentBatchTab();
+    } catch (error) {
+      batch.active = false;
+      batch.phase = 'error';
+      notify(error && error.message ? error.message : '无法打开显示式截图页面');
+      refreshControls();
+      return;
+    }
+    if (!hasList) notify('正在识别新版考核页面的可截图项目…', 5000);
+    refreshControls();
+    (hasList ? Promise.resolve(batch.items) : discoverAssessmentBatchItems(route, runId)).then((items) => {
+      if (!isAssessmentBatchCurrent(route, runId)) return;
+      batch.items = items;
+      batch.items.forEach((item) => { if (item.selected) item.failed = ''; });
+      batch.queue = batch.items.filter((item) => item.selected);
+      if (!batch.queue.length) {
+        closeAssessmentBatchTab();
+        batch.active = false;
+        batch.phase = batch.items.length ? 'ready' : 'empty';
+        notify(batch.items.length ? '所有项目均已截图，可在列表中重新勾选' : '新版考核页面未找到可用项目');
+        refreshControls();
+        return;
+      }
+      batch.phase = 'capturing';
+      notify('已选择' + batch.queue.length + '个考核项目，开始批量截图', 5000);
+      refreshControls();
+      return runAssessmentBatchScreenshot(batch.queue, route, runId);
+    }).catch((error) => {
+      if (batch.runId !== runId || location.href !== route || !isNewAssessmentPage()) return;
+      closeAssessmentBatchTab();
+      batch.active = false;
+      batch.phase = 'error';
+      logError('新版考核批量截图异常', error);
+      notify('新版考核批量截图异常');
+      refreshControls();
+    });
   }
 
   function downloadText(filename, content, mime = 'text/plain;charset=utf-8') {
@@ -2504,7 +3252,7 @@
     if (enforceMasterConfig()) saveConfig();
     const controlPage = getControlPage();
     if (controlPage.playback) patchBackgroundPausePolicy();
-    const controlPageKey = [controlPage.playback, controlPage.quiz, controlPage.discussion].join(':');
+    const controlPageKey = [controlPage.playback, controlPage.quiz, controlPage.discussion, isNewAssessmentPage()].join(':');
     if (state.controlPageKey !== controlPageKey) {
       state.controlPageKey = controlPageKey;
       refreshControls();
@@ -2588,6 +3336,38 @@
       '.fastuooc-auto-player-export{display:flex!important;align-items:center;justify-content:center;gap:7px;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:center}',
       '.fastuooc-auto-player-export:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
       '.fastuooc-auto-player-export svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}',
+      '.fastuooc-auto-player-screenshot{display:flex!important;align-items:center;justify-content:center;gap:7px;width:100%!important;height:38px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 11px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;text-align:center}',
+      '.fastuooc-auto-player-screenshot:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
+      '.fastuooc-auto-player-screenshot:disabled{opacity:.55!important;cursor:not-allowed!important}',
+      '.fastuooc-auto-player-screenshot svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}',
+      '.fastuooc-auto-player-screenshot-settings{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 10px;color:var(--panel-muted);font-size:12px}',
+      '.fastuooc-auto-player-screenshot-settings label{display:flex;align-items:center;gap:5px}',
+      '.fastuooc-auto-player-screenshot-scale{width:66px;height:28px;border:1px solid var(--panel-border);border-radius:6px;padding:0 5px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+      '.fastuooc-auto-player-screenshot-scale:disabled{opacity:.55}',
+      '.fastuooc-auto-assessment-batch{display:flex;flex-direction:column;gap:6px;padding:9px 10px;border:1px solid var(--panel-border);border-radius:10px;background:rgba(15,23,42,.08)}',
+      '.fastuooc-auto-assessment-batch span{color:var(--panel-muted);font-size:12px}',
+      '.fastuooc-auto-assessment-mode{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--panel-muted);font-size:12px}',
+      '.fastuooc-auto-assessment-mode select{min-width:116px;height:28px;border:1px solid var(--panel-border);border-radius:6px;padding:0 5px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+      '.fastuooc-auto-assessment-mode select:disabled{opacity:.55}',
+      '.fastuooc-auto-assessment-tools{display:grid;grid-template-columns:1.4fr 1fr 1fr 1fr;gap:4px}',
+      '.fastuooc-auto-assessment-tools button{height:28px;padding:0 4px;border:1px solid var(--panel-border);border-radius:6px;background:var(--button-bg);color:var(--button-text);font:600 11px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap}',
+      '.fastuooc-auto-assessment-tools button:hover{background:#2563eb;color:#fff}',
+      '.fastuooc-auto-assessment-tools button:disabled{opacity:.55;cursor:not-allowed}',
+      '.fastuooc-auto-assessment-list{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow-y:auto;padding:4px;border:1px solid var(--panel-border);border-radius:8px;background:var(--button-bg)}',
+      '.fastuooc-auto-assessment-list[hidden]{display:none}',
+      '.fastuooc-auto-assessment-item{display:flex;align-items:center;gap:6px;min-height:24px;padding:2px 4px;border-radius:5px;color:var(--button-text);font-size:12px;cursor:pointer}',
+      '.fastuooc-auto-assessment-item:hover{background:rgba(37,99,235,.12)}',
+      '.fastuooc-auto-assessment-item input{flex:none;margin:0}',
+      '.fastuooc-auto-assessment-item-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:inherit!important}',
+      '.fastuooc-auto-assessment-item-tag{flex:none;font-style:normal;font-size:11px;color:var(--panel-muted)}',
+      '.fastuooc-auto-assessment-item.is-done .fastuooc-auto-assessment-item-tag{color:#16a34a}',
+      '.fastuooc-auto-assessment-item.is-failed .fastuooc-auto-assessment-item-tag{color:#dc2626}',
+      '.fastuooc-auto-assessment-item.is-current{background:rgba(37,99,235,.18)}',
+      '.fastuooc-auto-assessment-actions{display:flex;gap:6px}',
+      '.fastuooc-auto-assessment-actions button{flex:1;height:32px;border:1px solid var(--panel-border);border-radius:8px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+      '.fastuooc-auto-assessment-start:hover{background:#2563eb;color:#fff}',
+      '.fastuooc-auto-assessment-stop:hover{background:#b91c1c;color:#fff}',
+      '.fastuooc-auto-assessment-actions button:disabled{opacity:.55;cursor:not-allowed}',
       '.fastuooc-auto-player-ai-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}',
       '.fastuooc-auto-player-ai{display:flex!important;align-items:center;justify-content:center;width:100%!important;height:36px!important;border:1px solid var(--panel-border)!important;border-radius:10px!important;padding:0 8px!important;background:var(--button-bg)!important;color:var(--button-text)!important;cursor:pointer;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important}',
       '.fastuooc-auto-player-ai:hover{background:#2563eb!important;border-color:#60a5fa!important;color:#fff!important;transform:none!important}',
@@ -2652,6 +3432,32 @@
         '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path></svg>',
         '<span>导出题目</span>',
         '</button>',
+        '<button class="fastuooc-auto-player-screenshot" data-action="screenshot" title="生成当前测验或作业的长截图" aria-label="生成当前测验或作业的长截图">',
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h2l1.5-2h7L17 7h2a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"></path><circle cx="12" cy="13" r="3.5"></circle></svg>',
+        '<span>长截图</span>',
+        '</button>',
+        '<div class="fastuooc-auto-player-screenshot-settings">',
+        '<label title="控制长截图的输出分辨率，范围0.5到4倍">分辨率 <input class="fastuooc-auto-player-screenshot-scale" data-role="screenshot-scale" type="number" min="0.5" max="4" step="0.1" inputmode="decimal"></label>',
+        '<span>倍</span>',
+        '</div>',
+        '<div class="fastuooc-auto-assessment-batch">',
+        '<span data-role="assessment-batch-summary">点击开始批量截图</span>',
+        '<label class="fastuooc-auto-assessment-mode">处理模式 <select data-role="assessment-batch-mode">',
+        '<option value="visible">显示式：打开页面</option>',
+        '<option value="hidden">隐藏式：后台处理</option>',
+        '</select></label>',
+        '<div class="fastuooc-auto-assessment-tools">',
+        '<button data-action="assessment-scan" type="button" title="识别当前页面可截图的考核项目">识别项目</button>',
+        '<button data-action="assessment-select-all" type="button" title="勾选全部项目">全选</button>',
+        '<button data-action="assessment-select-pending" type="button" title="只勾选尚未截图的项目">未截图</button>',
+        '<button data-action="assessment-select-none" type="button" title="取消全部勾选">清空</button>',
+        '</div>',
+        '<div class="fastuooc-auto-assessment-list" data-role="assessment-list" role="group" aria-label="选择需要截图的考核项目" hidden></div>',
+        '<div class="fastuooc-auto-assessment-actions">',
+        '<button class="fastuooc-auto-assessment-start" data-action="assessment-start" type="button">开始批量截图</button>',
+        '<button class="fastuooc-auto-assessment-stop" data-action="assessment-stop" type="button">停止批量截图</button>',
+        '</div>',
+        '</div>',
         '<div class="fastuooc-auto-player-ai-row">',
         '<button class="fastuooc-auto-player-ai" data-action="ai-analyze" title="获取AI参考选项，不会自动作答">AI参考</button>',
         '<button class="fastuooc-auto-player-ai" data-action="ai-settings" title="配置OpenAI兼容接口">AI设置</button>',
@@ -2674,6 +3480,13 @@
         const background = box.querySelector('[data-action="background"]');
         const theme = box.querySelector('[data-action="theme"]');
         const aiAnalyze = box.querySelector('[data-action="ai-analyze"]');
+        const screenshot = box.querySelector('[data-action="screenshot"]');
+        const screenshotScale = box.querySelector('[data-role="screenshot-scale"]');
+        const assessmentBatch = box.querySelector('.fastuooc-auto-assessment-batch');
+        const assessmentBatchSummary = box.querySelector('[data-role="assessment-batch-summary"]');
+        const assessmentBatchMode = box.querySelector('[data-role="assessment-batch-mode"]');
+        const assessmentBatchStart = box.querySelector('[data-action="assessment-start"]');
+        const assessmentBatchStop = box.querySelector('[data-action="assessment-stop"]');
         const discussionCount = box.querySelector('[data-role="discussion-count"]');
         const discussionUnlimited = box.querySelector('[data-action="discussion-unlimited"]');
         const discussionToggle = box.querySelector('[data-action="discussion-toggle"]');
@@ -2682,7 +3495,21 @@
         [enabled, next, mute, background].forEach((button) => { button.hidden = !controlPage.playback; });
         box.querySelector('[data-role="state"]').hidden = !controlPage.playback;
         box.querySelector('.fastuooc-auto-player-export').hidden = !controlPage.quiz;
+        screenshot.hidden = !controlPage.quiz;
+        screenshotScale.closest('.fastuooc-auto-player-screenshot-settings').hidden = !controlPage.quiz;
         box.querySelector('.fastuooc-auto-player-ai-row').hidden = !controlPage.quiz;
+        assessmentBatch.hidden = !isNewAssessmentPage();
+        assessmentBatchSummary.textContent = getAssessmentBatchSummary();
+        assessmentBatchMode.value = state.config.assessmentBatchMode;
+        assessmentBatchMode.disabled = state.assessmentBatch.active;
+        assessmentBatchStart.disabled = state.assessmentBatch.active;
+        assessmentBatchStop.disabled = !state.assessmentBatch.active;
+        box.querySelector('[data-action="assessment-scan"]').disabled = state.assessmentBatch.active;
+        box.querySelector('[data-action="assessment-scan"]').textContent = state.assessmentBatch.items.length ? '重新识别' : '识别项目';
+        ['assessment-select-all', 'assessment-select-pending', 'assessment-select-none'].forEach((name) => {
+          box.querySelector('[data-action="' + name + '"]').disabled = state.assessmentBatch.active || !state.assessmentBatch.items.length;
+        });
+        if (!assessmentBatch.hidden) renderAssessmentBatchList(box.querySelector('[data-role="assessment-list"]'));
         box.querySelector('.fastuooc-auto-discussion').hidden = !controlPage.discussion;
         if (!controlPage.quiz) {
           const aiSettings = document.getElementById('fastuooc-ai-settings');
@@ -2704,6 +3531,10 @@
         });
         aiAnalyze.disabled = state.aiRunning;
         aiAnalyze.textContent = state.aiRunning ? '分析中…' : 'AI参考';
+        screenshot.disabled = state.screenshotRunning;
+        screenshotScale.disabled = state.screenshotRunning;
+        screenshotScale.value = String(state.config.screenshotScale);
+        screenshot.querySelector('span').textContent = state.screenshotRunning ? '生成中…' : '长截图';
         if (document.activeElement !== discussionCount) discussionCount.value = state.config.discussionCount;
         discussionUnlimited.checked = Boolean(state.config.discussionUnlimited);
         discussionCount.disabled = state.discussion.running || state.config.discussionUnlimited;
@@ -2736,6 +3567,28 @@
         }
         if (action === 'export') {
           exportQuiz();
+          return;
+        }
+        if (action === 'screenshot') {
+          captureQuizScreenshot();
+          return;
+        }
+        if (action === 'assessment-start') {
+          startAssessmentBatchScreenshot();
+          return;
+        }
+        if (action === 'assessment-scan') {
+          scanAssessmentBatchItems();
+          return;
+        }
+        if (action === 'assessment-select-all' || action === 'assessment-select-pending' || action === 'assessment-select-none') {
+          setAssessmentSelection(action.slice('assessment-select-'.length));
+          return;
+        }
+        if (action === 'assessment-stop') {
+          if (!state.assessmentBatch.active) return;
+          stopAssessmentBatch();
+          notify('已停止新版考核批量截图');
           return;
         }
         if (action === 'ai-settings') {
@@ -2804,6 +3657,33 @@
         saveConfig();
         refreshControls();
       });
+      box.addEventListener('change', (event) => {
+        if (event.target.matches('[data-role="assessment-item"]')) {
+          const batch = state.assessmentBatch;
+          const item = batch.items.find((entry) => entry.key === event.target.dataset.key);
+          if (item && !batch.active) {
+            item.selected = event.target.checked;
+            saveAssessmentSelection();
+          }
+          refreshControls();
+          return;
+        }
+        if (event.target.matches('[data-role="assessment-batch-mode"]')) {
+          state.config.assessmentBatchMode = event.target.value === 'hidden' ? 'hidden' : 'visible';
+          saveConfig();
+          refreshControls();
+          return;
+        }
+        if (!event.target.matches('[data-role="screenshot-scale"]')) return;
+        const text = event.target.value.trim();
+        const raw = Number(text);
+        if (text && Number.isFinite(raw)) {
+          const value = Math.min(SCREENSHOT_SCALE_MAX, Math.max(SCREENSHOT_SCALE_MIN, raw));
+          state.config.screenshotScale = Math.round(value * 10) / 10;
+          saveConfig();
+        }
+        refreshControls();
+      });
       (document.body || document.documentElement).appendChild(box);
       update();
     };
@@ -2816,6 +3696,14 @@
       if (location.href !== state.lastRoute) {
         const previousUrl = state.lastRoute;
         state.lastRoute = location.href;
+        if (state.assessmentBatch.active) stopAssessmentBatch();
+        state.assessmentBatch.route = '';
+        state.assessmentBatch.phase = 'idle';
+        state.assessmentBatch.items = [];
+        state.assessmentBatch.queue = [];
+        state.assessmentBatch.index = 0;
+        state.assessmentBatch.completed = 0;
+        state.assessmentBatch.failures = [];
         log('检测到页面路由变化', {
           from: sanitizeUrlForLog(previousUrl),
           to: sanitizeUrlForLog(state.lastRoute),
@@ -2851,6 +3739,8 @@
       config: getDiagnosticSnapshot().config,
     });
     const initialize = () => {
+      installAssessmentBatchMessages();
+      installAssessmentCaptureWorker();
       installControls();
       startBackgroundPlaybackGuard();
       observe();
