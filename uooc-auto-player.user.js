@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.8.5
+// @version      0.8.6
 // @description  自动控制UOOC视频播放、课程讨论和题目导出，支持测验/作业/考试长截图与新版考核批量截图，并提供仅供参考的AI选项分析。
+// @homepageURL  https://greasyfork.org/zh-CN/scripts/595099-fast-uooc
+// @supportURL   https://github.com/Liunian06/fastuooc/issues/
+// @tag          uooc
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
+// @resource     fastuooc-sponsor-image buymecoffee.jpg
 // @author       Liunian06
 // @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
@@ -24,6 +28,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_download
+// @grant        GM_getResourceURL
 // @grant        unsafeWindow
 // @connect      *
 // ==/UserScript==
@@ -32,12 +37,21 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.8.5';
+  const SCRIPT_VERSION = '0.8.6';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const SCREENSHOT_SCALE_DEFAULT = 1.5;
   const SCREENSHOT_SCALE_MIN = 0.5;
   const SCREENSHOT_SCALE_MAX = 4;
+  const SPONSOR_IMAGE_URL = (() => {
+    try {
+      return typeof GM_getResourceURL === 'function'
+        ? GM_getResourceURL('fastuooc-sponsor-image')
+        : 'buymecoffee.jpg';
+    } catch (_) {
+      return 'buymecoffee.jpg';
+    }
+  })();
   const ASSESSMENT_SELECTION_KEY_PREFIX = 'fastuooc:assessment-batch:selection:';
   const DEFAULT_CONFIG = Object.freeze({
     enabled: true,
@@ -1661,7 +1675,7 @@
       model: state.config.aiModel,
       messages,
       temperature: 0.2,
-      max_tokens: 50,
+      max_tokens: 500,
     });
     return enqueueAI(() => new Promise((resolve, reject) => {
       const configuredTimeout = Math.max(5000, Number(state.config.aiTimeout) || 45000);
@@ -1848,7 +1862,7 @@
       '题目或选项中的[题目图片1]、[选项A图片1]等标记对应消息后附带的同名图片。请读取图片中的文字、公式和图形，不要依据文件名猜测；若模型无法识别图片，只输出“无法确定”。',
       '题型：' + typeLabel,
       item.isMultiple
-        ? '输出规则：这是多选题，只输出所有最可能正确的选项标签，按题目顺序用英文逗号分隔，例如A,C。不要输出解释、标点前缀、Markdown或其他文字。'
+        ? '输出规则：这是多选题，实际选项数量不固定，可能超过4个；必须根据题目给出的全部选项判断，不要假定最多只有4个选项。只输出所有最可能正确的选项标签，按题目顺序用英文逗号分隔，例如A,C或A,C,E。不要输出解释、标点前缀、Markdown或其他文字。'
         : '输出规则：这是单选题，只输出一个最可能正确的选项标签，例如A。不要输出解释、标点前缀、Markdown或多个选项。',
       '',
       '题目：',
@@ -1918,7 +1932,7 @@
     if (!doc || doc.getElementById('fastuooc-ai-reference-style')) return;
     const style = doc.createElement('style');
     style.id = 'fastuooc-ai-reference-style';
-    style.textContent = '.fastuooc-ai-reference{display:inline-flex;align-items:center;gap:5px;margin:0 0 8px 8px;padding:3px 8px;border:1px solid rgba(37,99,235,.25);border-radius:999px;background:rgba(37,99,235,.08);color:#2563eb;font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.fastuooc-ai-reference.is-uncertain{border-color:rgba(100,116,139,.25);background:rgba(100,116,139,.08);color:#64748b}.fastuooc-ai-reference.is-waiting{border-color:rgba(148,163,184,.24);background:rgba(148,163,184,.08);color:#94a3b8}.fastuooc-ai-reference.is-loading{color:#2563eb;animation:fastuooc-ai-pulse 1.1s ease-in-out infinite}@keyframes fastuooc-ai-pulse{50%{opacity:.45}}';
+    style.textContent = '.fastuooc-ai-reference{display:inline-flex;align-items:center;flex-wrap:wrap;gap:5px;max-width:calc(100% - 8px);box-sizing:border-box;margin:0 0 8px 8px;padding:3px 8px;border:1px solid rgba(37,99,235,.25);border-radius:999px;background:rgba(37,99,235,.08);color:#2563eb;font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:normal;overflow-wrap:anywhere;word-break:break-word;vertical-align:middle}.fastuooc-ai-reference.is-uncertain{border-color:rgba(100,116,139,.25);background:rgba(100,116,139,.08);color:#64748b}.fastuooc-ai-reference.is-waiting{border-color:rgba(148,163,184,.24);background:rgba(148,163,184,.08);color:#94a3b8}.fastuooc-ai-reference.is-loading{color:#2563eb;animation:fastuooc-ai-pulse 1.1s ease-in-out infinite}@keyframes fastuooc-ai-pulse{50%{opacity:.45}}';
     (doc.head || doc.documentElement).appendChild(style);
   }
 
@@ -3294,6 +3308,31 @@
     };
   }
 
+  function openSponsorDialog() {
+    const existing = document.getElementById('fastuooc-sponsor-dialog');
+    if (existing) {
+      existing.hidden = false;
+      return;
+    }
+    const modal = document.createElement('div');
+    modal.id = 'fastuooc-sponsor-dialog';
+    modal.innerHTML = [
+      '<div class="fastuooc-sponsor-backdrop" data-sponsor-action="close"></div>',
+      '<section class="fastuooc-sponsor-dialog" role="dialog" aria-modal="true" aria-labelledby="fastuooc-sponsor-title">',
+      '<div class="fastuooc-sponsor-head"><strong id="fastuooc-sponsor-title">请作者喝杯咖啡</strong><button type="button" data-sponsor-action="close" aria-label="关闭赞助弹窗">×</button></div>',
+      '<p class="fastuooc-sponsor-help">如果这个脚本对你有帮助，欢迎支持一下作者。</p>',
+      '<div class="fastuooc-sponsor-image-wrap"><img class="fastuooc-sponsor-image" alt="赞助二维码" loading="lazy"></div>',
+      '</section>',
+    ].join('');
+    modal.querySelector('.fastuooc-sponsor-image').src = SPONSOR_IMAGE_URL;
+    const close = () => modal.remove();
+    modal.addEventListener('click', (event) => {
+      const actionNode = event.target.closest('[data-sponsor-action]');
+      if (actionNode && actionNode.dataset.sponsorAction === 'close') close();
+    });
+    (document.body || document.documentElement).appendChild(modal);
+  }
+
   function installControls() {
     const style = document.createElement('style');
     style.textContent = [
@@ -3305,7 +3344,7 @@
       '#fastuooc-auto-player-controls:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(15,23,42,.34),0 3px 10px rgba(15,23,42,.2)}',
       '#fastuooc-auto-player-controls [hidden]{display:none!important}',
       '#fastuooc-auto-player-controls.is-collapsed{width:42px;border-radius:21px}',
-      '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title-main,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-body,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-github,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-theme{display:none!important}',
+      '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title-main,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-body,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-github,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-sponsor,#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-theme{display:none!important}',
       '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title{justify-content:center;padding:9px 0}',
       '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-title-tools{display:block}',
       '#fastuooc-auto-player-controls.is-collapsed .fastuooc-auto-player-collapse svg{transform:rotate(180deg)}',
@@ -3316,6 +3355,18 @@
       '.fastuooc-auto-player-github{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;color:var(--panel-muted);text-decoration:none;transition:background .18s ease,color .18s ease,transform .18s ease}',
       '.fastuooc-auto-player-github:hover{background:var(--button-bg);color:var(--panel-text);transform:translateY(-1px)}',
       '.fastuooc-auto-player-github svg{width:17px;height:17px;fill:currentColor}',
+      '.fastuooc-auto-player-sponsor{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:50%;padding:0;background:transparent;color:var(--panel-muted);cursor:pointer;transition:background .18s ease,color .18s ease,transform .18s ease}',
+      '.fastuooc-auto-player-sponsor:hover{background:var(--button-bg);color:var(--panel-text);transform:translateY(-1px)}',
+      '.fastuooc-auto-player-sponsor svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}',
+      '#fastuooc-sponsor-dialog{position:fixed;inset:0;z-index:2147483647}',
+      '.fastuooc-sponsor-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.48);backdrop-filter:blur(5px)}',
+      '.fastuooc-sponsor-dialog{position:absolute;top:50%;left:50%;width:min(380px,calc(100vw - 28px));transform:translate(-50%,-50%);padding:18px;border:1px solid rgba(148,163,184,.28);border-radius:16px;background:#fff;color:#172033;box-shadow:0 24px 70px rgba(15,23,42,.3)}',
+      '.fastuooc-sponsor-head{display:flex;align-items:center;justify-content:space-between;font-size:16px}',
+      '.fastuooc-sponsor-head button{width:30px;height:30px;border:0;border-radius:50%;background:#f1f5f9;color:#64748b;font-size:20px;line-height:1;cursor:pointer}',
+      '.fastuooc-sponsor-help{margin:8px 0 14px;color:#64748b}',
+      '.fastuooc-sponsor-image-wrap{display:flex;justify-content:center;overflow:hidden;border-radius:12px;background:#f8fafc}',
+      '.fastuooc-sponsor-image{display:block;width:100%;max-height:min(62vh,520px);object-fit:contain}',
+      '@media(prefers-color-scheme:dark){.fastuooc-sponsor-dialog{background:#121824;color:#e7edf7}.fastuooc-sponsor-head button{background:#334155;color:#cbd5e1}.fastuooc-sponsor-help{color:#94a3b8}.fastuooc-sponsor-image-wrap{background:#1e293b}}',
       '.fastuooc-auto-player-collapse{display:inline-flex;align-items:center;justify-content:center;width:30px!important;height:30px!important;padding:0!important;border:0!important;border-radius:50%!important;background:transparent!important;color:var(--panel-muted)!important;font-size:0!important;line-height:1!important;transition:background .18s ease,color .18s ease,transform .18s ease!important}',
       '.fastuooc-auto-player-collapse:hover{background:var(--button-bg)!important;color:var(--panel-text)!important;transform:none!important}',
       '.fastuooc-auto-player-collapse svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s ease}',
@@ -3398,6 +3449,9 @@
         '<div class="fastuooc-auto-player-title">',
         '<div class="fastuooc-auto-player-title-main"><span>Fast UOOC</span></div>',
         '<div class="fastuooc-auto-player-title-tools">',
+        '<button class="fastuooc-auto-player-sponsor" data-action="sponsor" type="button" title="赞助作者" aria-label="赞助作者">',
+        '<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M862.663111 464.327111a146.346667 146.346667 0 0 0-42.666667 5.973333v-48.64a128 128 0 0 0-128-128H128.369778a128 128 0 0 0-128 128v245.333334a341.333333 341.333333 0 0 0 341.333333 341.333333h138.666667a341.333333 341.333333 0 0 0 329.813333-256 145.066667 145.066667 0 0 0 52.48 10.666667 149.333333 149.333333 0 0 0 0-298.666667z m-128 202.666667a256 256 0 0 1-256 256h-136.96a256 256 0 0 1-256-256v-245.333334a42.666667 42.666667 0 0 1 42.666667-42.666666h565.333333a42.666667 42.666667 0 0 1 42.666667 42.666666l-1.706667 245.333334z m128 10.666666a62.72 62.72 0 0 1-37.546667-12.373333h-3.413333v-101.546667h2.986667a64 64 0 1 1 37.973333 113.92zM204.743111 188.302222l-8.106667 12.373334a42.666667 42.666667 0 0 0 11.946667 59.306666 42.666667 42.666667 0 0 0 23.466667 7.253334 42.666667 42.666667 0 0 0 35.413333-19.2l8.106667-12.373334a102.826667 102.826667 0 0 0-13.226667-128 19.626667 19.626667 0 0 1-2.986667-27.306666l9.386667-15.786667A42.666667 42.666667 0 0 0 195.356444 21.048889l-9.386666 16.64a105.386667 105.386667 0 0 0 15.36 128c6.968889 5.432889 8.448 15.36 3.413333 22.613333z m178.773333 0l-8.106666 12.373334a42.666667 42.666667 0 0 0 35.413333 66.56 42.666667 42.666667 0 0 0 35.413333-19.2l8.106667-12.373334a102.826667 102.826667 0 0 0-13.226667-128 20.053333 20.053333 0 0 1-3.413333-27.306666l9.813333-15.786667a42.666667 42.666667 0 0 0-73.386666-43.52l-9.386667 16.64a105.386667 105.386667 0 0 0 16.64 128c6.172444 5.973333 7.082667 15.587556 2.133333 22.613333z m178.773334 0l-8.106667 12.373334a42.666667 42.666667 0 0 0 35.413333 66.56 42.666667 42.666667 0 0 0 35.413334-19.2l8.106666-12.373334a102.826667 102.826667 0 0 0-13.226666-128 20.053333 20.053333 0 0 1-3.413334-27.306666l11.52-15.36A42.666667 42.666667 0 0 0 611.356444 6.542222a42.666667 42.666667 0 0 0-58.453333 14.506667l-10.24 16.64a105.813333 105.813333 0 0 0 16.213333 128 17.493333 17.493333 0 0 1 3.413334 22.613333z" fill="currentColor"></path></svg>',
+        '</button>',
         '<a class="fastuooc-auto-player-github" href="https://github.com/Liunian06/fastuooc" target="_blank" rel="noopener noreferrer" title="打开GitHub项目主页" aria-label="打开GitHub项目主页">',
         '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2.01c-3.2.7-3.87-1.54-3.87-1.54-.53-1.34-1.28-1.7-1.28-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.56-.29-5.26-1.28-5.26-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.18 1.18a11.06 11.06 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.77.12 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.4-5.27 5.68.42.36.78 1.08.78 2.18v3.23c0 .31.21.67.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"></path></svg>',
         '</a>',
@@ -3563,6 +3617,10 @@
           const collapsed = box.classList.toggle('is-collapsed');
           control.setAttribute('title', collapsed ? '展开控制面板' : '折叠控制面板');
           control.setAttribute('aria-label', collapsed ? '展开控制面板' : '折叠控制面板');
+          return;
+        }
+        if (action === 'sponsor') {
+          openSponsorDialog();
           return;
         }
         if (action === 'export') {

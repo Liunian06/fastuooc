@@ -1,4 +1,6 @@
 *
+# 本地赞助图片不纳入仓库
+buymecoffee.jpg
 !.gitignore
 !README.md
 !LICENSE
