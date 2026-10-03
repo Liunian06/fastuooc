@@ -7,7 +7,7 @@
 // @supportURL   https://github.com/Liunian06/fastuooc/issues/
 // @tag          uooc
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
-// @resource     fastuooc-sponsor-image buymecoffee.jpg
+// @resource     fastuooc-sponsor-image https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg
 // @author       Liunian06
 // @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
@@ -46,10 +46,10 @@
   const SPONSOR_IMAGE_URL = (() => {
     try {
       return typeof GM_getResourceURL === 'function'
-        ? GM_getResourceURL('fastuooc-sponsor-image')
-        : 'buymecoffee.jpg';
+        ? GM_getResourceURL('fastuooc-sponsor-image') || 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg'
+        : 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg';
     } catch (_) {
-      return 'buymecoffee.jpg';
+      return 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg';
     }
   })();
   const ASSESSMENT_SELECTION_KEY_PREFIX = 'fastuooc:assessment-batch:selection:';

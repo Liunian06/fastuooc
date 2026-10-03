@@ -66,6 +66,14 @@ Fast UOOC是一款面向UOOC在线学习页面的Tampermonkey用户脚本，专�
 
 AI参考不会修改选项状态，也不会自动提交测验。请结合课程材料独立判断结果。
 
+## 赞助支持
+
+如果Fast UOOC对你有帮助，欢迎请作者喝杯咖啡：
+
+<p align="center">
+  <img src="buymecoffee.jpg" alt="赞助二维码" width="360">
+</p>
+
 ## 许可证
 
 本项目采用[MIT许可证](LICENSE)开源。

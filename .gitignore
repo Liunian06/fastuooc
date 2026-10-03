@@ -1,6 +1,6 @@
 *
-# 本地赞助图片不纳入仓库
-buymecoffee.jpg
+# 赞助二维码需要随脚本发布
+!buymecoffee.jpg
 !.gitignore
 !README.md
 !LICENSE
