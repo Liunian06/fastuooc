@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.8.6
-// @description  自动控制UOOC视频播放、课程讨论和题目导出，支持测验/作业/考试长截图与新版考核批量截图，并提供仅供参考的AI选项分析。
+// @version      0.9.0
+// @description  自动控制UOOC视频播放、课程讨论和题目导出，支持传统自动讨论、基于帖子内容生成纯文本回复的AI讨论、测验/作业/考试长截图与新版考核批量截图，并提供仅供参考的AI选项分析。
 // @homepageURL  https://greasyfork.org/zh-CN/scripts/595099-fast-uooc
 // @supportURL   https://github.com/Liunian06/fastuooc/issues/
 // @tag          uooc
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
-// @resource     fastuooc-sponsor-image https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg
+// @resource    fastuooc-sponsor-image https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg
 // @author       Liunian06
 // @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
@@ -37,7 +37,7 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.8.6';
+  const SCRIPT_VERSION = '0.9.0';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const SCREENSHOT_SCALE_DEFAULT = 1.5;
@@ -124,8 +124,27 @@
       lastPage: 0,
       lastThreadId: '',
       lastContent: '',
+      lastTitle: '',
+      lastReply: '',
+      seenThreadIds: new Set(),
       remainingMs: 0,
     },
+    aiDiscussion: {
+      running: false,
+      phase: 'idle',
+      completed: 0,
+      target: 1,
+      timer: null,
+      runId: 0,
+      lastPage: 0,
+      lastThreadId: '',
+      lastTitle: '',
+      lastContent: '',
+      lastReply: '',
+      remainingMs: 0,
+      seenThreadIds: new Set(),
+    },
+    discussionExitTimer: null,
     controlsUpdate: null,
   };
 
@@ -246,6 +265,15 @@
           lastThreadId: state.discussion.lastThreadId,
           remainingMs: state.discussion.remainingMs,
         },
+        aiDiscussion: {
+          running: state.aiDiscussion.running,
+          phase: state.aiDiscussion.phase,
+          completed: state.aiDiscussion.completed,
+          target: state.aiDiscussion.target,
+          lastPage: state.aiDiscussion.lastPage,
+          lastThreadId: state.aiDiscussion.lastThreadId,
+          remainingMs: state.aiDiscussion.remainingMs,
+        },
       },
       dom: {
         videoCount: document.querySelectorAll('video').length,
@@ -308,6 +336,7 @@
   }
 
   const DISCUSSION_WAIT_MS = 120000;
+  const DISCUSSION_REPLY_MAX_LENGTH = 600;
   const DISCUSSION_OPERATION_TIMEOUT = 18000;
 
   function refreshControls() {
@@ -330,13 +359,20 @@
     }
   }
 
+  function assertAIDiscussionRun(runId) {
+    if (!state.aiDiscussion.running || state.aiDiscussion.runId !== runId) {
+      throw createStoppedDiscussionError();
+    }
+  }
+
   async function waitForCondition(predicate, options = {}) {
     const timeout = Math.max(500, Number(options.timeout) || 10000);
     const interval = Math.max(50, Number(options.interval) || 250);
     const runId = options.runId;
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-      if (runId != null) assertDiscussionRun(runId);
+      if (typeof options.assertRun === 'function') options.assertRun();
+      else if (runId != null) assertDiscussionRun(runId);
       if (options.isCancelled && options.isCancelled()) return null;
       try {
         const value = await predicate();
@@ -353,7 +389,8 @@
     const segments = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     const normalized = segments.map((part) => {
       try { return decodeURIComponent(part); } catch (_) { return part; }
-    });
+    }).map((part) => String(part).split(/[?#;]/)[0]);
+    const normalizedLower = normalized.map((part) => part.toLowerCase());
     const stateService = getStateService();
     const stateName = stateService && stateService.current && stateService.current.name || '';
     const stateParams = stateService && stateService.params || {};
@@ -364,15 +401,20 @@
       pageWindow.cid ||
       ''
     );
-    const isNewDetail = normalized.includes('discussDetail') || stateName === 'course.discuss.discussDetail';
-    const isNewList = !isNewDetail && (normalized[0] === 'discuss' || stateName === 'course.discuss');
-    const isOldDetail = normalized[0] === 'discussdetail' || stateName === 'course.discussdetail';
-    const isOldList = !isOldDetail && normalized[0] === 'discusscom' || stateName === 'course.discusscom';
+    const hasOldDetailHash = normalizedLower[0] === 'discussdetail';
+    const hasOldListHash = normalizedLower[0] === 'discusscom';
+    const hasNewDetailHash = !hasOldDetailHash && normalizedLower.includes('discussdetail');
+    const hasNewListHash = !hasOldDetailHash && !hasOldListHash && normalizedLower[0] === 'discuss';
+    const isOldDetail = hasOldDetailHash || (!hasNewDetailHash && stateName === 'course.discussdetail');
+    const isOldList = !isOldDetail && (hasOldListHash || (!hasNewListHash && stateName === 'course.discusscom'));
+    const isNewDetail = !isOldDetail && (hasNewDetailHash || stateName === 'course.discuss.discussDetail');
+    const isNewList = !isOldDetail && !isNewDetail && (hasNewListHash || stateName === 'course.discuss');
     let threadId = String(stateParams.tid || '');
     if (!threadId && isOldDetail && normalized[2]) threadId = normalized[2];
     if (!threadId && isNewDetail) {
       const numericSegments = normalized.filter((part) => /^\d+$/.test(part));
-      threadId = numericSegments[0] || '';
+      const threadCandidates = numericSegments.filter((part) => String(part) !== String(courseId));
+      threadId = threadCandidates[0] || numericSegments[0] || '';
     }
     return {
       kind: isNewDetail || isOldDetail ? 'detail' : isNewList || isOldList ? 'list' : '',
@@ -483,7 +525,7 @@
     return Math.floor(Math.random() * (max - min + 1)) + min;
   }
 
-  async function waitForDiscussionList(runId, mode) {
+  async function waitForDiscussionList(runId, mode, assertRun) {
     return waitForCondition(() => {
       const scope = getDiscussionListScope();
       if (!scope) return null;
@@ -491,10 +533,10 @@
       const pageCount = getDiscussionPageCount(scope, mode);
       if (!Array.isArray(list) || !pageCount) return null;
       return { scope, list, pageCount };
-    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, runId });
+    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, assertRun: assertRun || (() => assertDiscussionRun(runId)) });
   }
 
-  async function switchDiscussionPage(scope, mode, page, runId) {
+  async function switchDiscussionPage(scope, mode, page, runId, assertRun) {
     const beforeList = getDiscussionList(scope);
     const before = discussionListFingerprint(getDiscussionList(scope));
     await invokeAngular(scope, () => {
@@ -519,7 +561,7 @@
         return { scope: currentScope, list };
       }
       return null;
-    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, runId });
+    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, assertRun: assertRun || (() => assertDiscussionRun(runId)) });
     if (!switched) throw new Error('讨论分页加载超时');
     return getDiscussionListScope();
   }
@@ -569,6 +611,13 @@
       .trim();
   }
 
+  function getDiscussionTitle(scope) {
+    const raw = scope && scope.threads && (scope.threads.subject || scope.threads.title || scope.threads.name);
+    if (raw && String(raw).trim()) return discussionHtmlToText(raw);
+    const node = document.querySelector('.discussionTitle, .thesis-title, [ng-bind="threads.subject"], [ng-bind="threads.title"]');
+    return node ? discussionHtmlToText(node.innerHTML || node.textContent || '') : '';
+  }
+
   function getDiscussionContent(scope) {
     const raw = scope && scope.threads && scope.threads.content;
     if (raw && String(raw).trim()) return discussionHtmlToText(raw);
@@ -576,28 +625,92 @@
     return node ? discussionHtmlToText(node.innerHTML || node.textContent || '') : '';
   }
 
-  function setDiscussionEditorContent(content) {
+  function normalizeDiscussionReply(value) {
+    let text = String(value || '').trim();
+    if (!text) return '';
+    text = discussionHtmlToText(text)
+      .replace(/```(?:text|plaintext|plain)?/gi, '')
+      .replace(/```/g, '')
+      .replace(/\$\$/g, '')
+      .replace(/\\?\(|\\?\)/g, '')
+      .replace(/\\?\[|\\?\]/g, '')
+      .replace(/\\[a-zA-Z]+/g, '')
+      .replace(/[{}]/g, '')
+      .replace(/^\s{0,3}#{1,6}\s*/gm, '')
+      .replace(/[*_`~]/g, '')
+      .replace(/^[ \t]*[-+]\s+/gm, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return text.slice(0, DISCUSSION_REPLY_MAX_LENGTH).trim();
+  }
+
+  function buildAIDiscussionMessages(title, content) {
+    return [
+      {
+        role: 'system',
+        content: [
+          '你是一名认真参与在线课程讨论的学生。',
+          '请根据帖子题目和正文，写一条有价值、具体、自然、有一定新意的中文回复。',
+          '回复要回应原帖中的核心问题，补充可执行的理解、方法、例子或容易忽略的角度，避免空泛赞同、重复原文、机械套话和灌水。',
+          '只输出最终回复正文，使用纯文本raw text，不要输出Markdown、HTML、LaTeX公式、标题、引号、前缀或解释，也不要提及AI、提示词或生成过程。',
+          '如果涉及公式，请改用普通文字、算式或文字描述表达。回复控制在80到220字之间。',
+          '负向案例：题目“无穷小和无穷大是很小/很大的数吗？关系是什么？”，回复虽然概念基本准确、表达清楚，但只得到93分，说明仅停留在通用的概念解释、简单倒数关系和趋近过程提醒，缺少更深入的分析、具体方法或独到角度时，不应作为高质量满分范例。',
+          '正向案例：题目“极限计算有什么实用技巧？刚学完数列极限与函数极限，每次碰到夹逼准则、洛必达法则的适用场景总容易混，想问问大家有没有快速判断方法，或者好用的解题小经验可以分享？”。高质量回复应像下面这样，针对题目比较夹逼准则与洛必达法则的适用边界，说明夹逼适合非光滑、不可导或含振荡因子的结构，洛必达适合满足规定型未定式且导数能显著简化的情形；还应提醒数列离散性、连续化处理、复杂度增长和优先使用泰勒展开等方法，体现深入细致、分析透彻、表达规范和独到见解。请学习这种分析深度和针对性，但不要机械复制内容，必须结合当前帖子重新作答。',
+          '请在内部静默完成一次质量自检和修改，不要生成多个候选回复，也不要进行第二次调用。自检时按以下标准衡量：是否直接回应帖子核心问题；概念和结论是否准确；是否说明方法的适用条件；是否补充至少一个边界、限制或容易误用的情况；是否提供具体判断顺序、操作方法或实用经验；是否补充了原帖没有明确表达的独到角度；是否表达自然、像真实学生参与讨论。发现缺项时，请在本次生成过程中直接重写，最终只输出一条纯文本回复，不要输出评分、检查清单、修改过程、候选版本或任何AI说明。',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: '帖子题目：\n' + title + '\n\n帖子正文：\n' + content,
+      },
+    ];
+  }
+
+  function setDiscussionEditorContent(content, detailScope) {
     const editor = pageWindow.DIR_EDITORS && (pageWindow.DIR_EDITORS.noteEditorAll || pageWindow.DIR_EDITORS.noteEditor);
     if (editor && typeof editor.setContent === 'function') {
-      try { editor.setContent(content); } catch (_) {}
+      const applyEditorContent = () => {
+        try { editor.setContent(content); } catch (_) {}
+      };
+      try {
+        if (editor.isReady === false && typeof editor.ready === 'function') editor.ready(applyEditorContent);
+        else applyEditorContent();
+      } catch (_) {
+        applyEditorContent();
+      }
+    }
+    if (detailScope && Object.prototype.hasOwnProperty.call(detailScope, 'noteContent')) {
+      detailScope.noteContent = content;
     }
     document.querySelectorAll('textarea[ng-model="content"], textarea[ng-model="noteContent"]').forEach((textarea) => {
       const setter = Object.getOwnPropertyDescriptor(pageWindow.HTMLTextAreaElement.prototype, 'value');
       if (setter && setter.set) setter.set.call(textarea, content);
       else textarea.value = content;
+      try {
+        const editorScope = pageWindow.angular && pageWindow.angular.element(textarea).scope();
+        if (editorScope && Object.prototype.hasOwnProperty.call(editorScope, 'content')) {
+          editorScope.content = content;
+          if (typeof editorScope.$evalAsync === 'function') editorScope.$evalAsync();
+        }
+        if (editorScope && Object.prototype.hasOwnProperty.call(editorScope, 'noteContent')) {
+          editorScope.noteContent = content;
+          if (typeof editorScope.$evalAsync === 'function') editorScope.$evalAsync();
+        }
+      } catch (_) {}
       textarea.dispatchEvent(new Event('input', { bubbles: true }));
       textarea.dispatchEvent(new Event('change', { bubbles: true }));
     });
   }
 
-  async function sendDiscussionReply(route, threadId, content, runId) {
+  async function sendDiscussionReply(route, threadId, content, runId, assertRun) {
+    const checkRun = assertRun || (() => assertDiscussionRun(runId));
     const detailScope = await waitForCondition(() => getDiscussionDetailScope(), {
       timeout: DISCUSSION_OPERATION_TIMEOUT,
       interval: 250,
-      runId,
+      assertRun: checkRun,
     });
     if (!detailScope) throw new Error('帖子详情未加载完成，无法发送回复');
-    setDiscussionEditorContent(content);
+    setDiscussionEditorContent(content, detailScope);
     const courseService = getCourseService();
     if (!courseService || typeof courseService.discReply !== 'function') {
       throw new Error('当前页面未找到讨论回复接口');
@@ -619,29 +732,62 @@
     return response;
   }
 
-  function waitForDiscussionDelay(runId) {
-    state.discussion.phase = 'waiting';
+  async function sendDiscussionReplyByApi(route, threadId, content, assertRun) {
+    const detailScope = await waitForCondition(() => getDiscussionDetailScope(), {
+      timeout: DISCUSSION_OPERATION_TIMEOUT,
+      interval: 250,
+      assertRun,
+    });
+    if (!detailScope) throw new Error('帖子详情未加载完成，无法发送回复');
+    assertRun();
+    setDiscussionEditorContent(content, detailScope);
+    await sleep(200);
+    assertRun();
+    const courseService = getCourseService();
+    if (!courseService || typeof courseService.discReply !== 'function') {
+      throw new Error('当前页面未找到讨论回复接口');
+    }
+    const response = await invokeAngular(detailScope, () => courseService.discReply({
+      cid: route.courseId,
+      tid: String(threadId),
+      content,
+      images: null,
+    }));
+    assertRun();
+    await sleep(800);
+    const refreshed = await invokeAngular(detailScope, () => {
+      if (typeof detailScope.getList === 'function') return detailScope.getList();
+      if (typeof detailScope.getDetail === 'function') return detailScope.getDetail();
+      return null;
+    });
+    await sleep(500);
+    assertRun();
+    return { response, refreshed };
+  }
+
+  function waitForDiscussionDelay(runId, discussionState = state.discussion, assertRun = () => assertDiscussionRun(runId)) {
+    discussionState.phase = 'waiting';
     refreshControls();
     return new Promise((resolve, reject) => {
       const deadline = Date.now() + DISCUSSION_WAIT_MS;
       const tick = () => {
         try {
-          assertDiscussionRun(runId);
+          assertRun();
           const remaining = Math.max(0, deadline - Date.now());
-          state.discussion.remainingMs = remaining;
+          discussionState.remainingMs = remaining;
           refreshControls();
           if (!remaining) {
-            clearInterval(state.discussion.timer);
-            state.discussion.timer = null;
+            clearInterval(discussionState.timer);
+            discussionState.timer = null;
             resolve();
           }
         } catch (error) {
-          clearInterval(state.discussion.timer);
-          state.discussion.timer = null;
+          clearInterval(discussionState.timer);
+          discussionState.timer = null;
           reject(error);
         }
       };
-      state.discussion.timer = setInterval(tick, 1000);
+      discussionState.timer = setInterval(tick, 1000);
       tick();
     });
   }
@@ -652,7 +798,27 @@
     return minutes + '分' + String(seconds % 60).padStart(2, '0') + '秒';
   }
 
+  function clearDiscussionExitTimer() {
+    clearTimeout(state.discussionExitTimer);
+    state.discussionExitTimer = null;
+  }
+
+  function scheduleDiscussionStopIfNeeded() {
+    if (!state.discussion.running && !state.aiDiscussion.running) {
+      clearDiscussionExitTimer();
+      return;
+    }
+    clearDiscussionExitTimer();
+    state.discussionExitTimer = setTimeout(() => {
+      state.discussionExitTimer = null;
+      if (getDiscussionRoute().kind) return;
+      if (state.discussion.running) stopDiscussion('已离开综合讨论，自动讨论已停止');
+      if (state.aiDiscussion.running) stopAIDiscussion('已离开综合讨论，AI讨论已停止');
+    }, 2500);
+  }
+
   function finishDiscussion(message) {
+    clearDiscussionExitTimer();
     clearInterval(state.discussion.timer);
     state.discussion.timer = null;
     state.discussion.running = false;
@@ -733,7 +899,7 @@
       notify('请先进入课程的综合讨论页');
       return;
     }
-    if (state.discussion.running) return;
+    if (state.discussion.running || state.aiDiscussion.running) return;
     const count = Math.max(1, Math.floor(Number(state.config.discussionCount) || 1));
     state.config.discussionCount = count;
     saveConfig();
@@ -750,6 +916,179 @@
     refreshControls();
     notify(state.config.discussionUnlimited ? '自动讨论已启动，将持续执行' : '自动讨论已启动，共' + count + '次');
     runDiscussionLoop(runId, route);
+  }
+
+  function chooseAIDiscussionItem(list) {
+    const available = list.filter((item) => {
+      const threadId = discussionItemId(item);
+      return threadId && !state.aiDiscussion.seenThreadIds.has(threadId);
+    });
+    if (!available.length) {
+      state.aiDiscussion.seenThreadIds.clear();
+      return list.find((item) => discussionItemId(item)) || null;
+    }
+    return available[randomInteger(0, available.length - 1)];
+  }
+
+  function hasDiscussionDetailEvidence() {
+    const hash = String(location.hash || '').toLowerCase();
+    if (hash.includes('discussdetail')) return true;
+    return !!document.querySelector([
+      '.discussionTitle',
+      '.thesis-title',
+      '[ng-bind-html*="threads.content"]',
+      '.discussionDesc',
+      '.thesis-content',
+      '.CourseDiscussionHeader',
+      '.discuzDetails',
+    ].join(','));
+  }
+
+  async function waitForDiscussionRoute(kind, mode, threadId, assertRun) {
+    const matched = await waitForCondition(() => {
+      const current = getDiscussionRoute();
+      if (kind === 'detail') {
+        const routeMatches = current.kind === 'detail';
+        const stateMatches = /detail/i.test(String(current.stateName || ''));
+        const domMatches = hasDiscussionDetailEvidence();
+        if (!routeMatches && !stateMatches && !domMatches) return null;
+        if (threadId && current.threadId && current.threadId !== String(threadId)) {
+          logWarning('讨论详情路由帖子ID解析不一致，继续使用已请求的帖子', {
+            expectedThreadId: String(threadId),
+            parsedThreadId: current.threadId,
+            stateName: current.stateName,
+            hash: location.hash,
+          });
+        }
+        return Object.assign({}, current, { kind: 'detail', mode: current.mode || mode });
+      }
+      if (current.kind !== kind || current.mode !== mode) return null;
+      return current;
+    }, { timeout: DISCUSSION_OPERATION_TIMEOUT, interval: 250, assertRun });
+    if (!matched) throw new Error(kind === 'detail' ? '帖子详情页面加载超时' : '返回综合讨论页超时');
+    return matched;
+  }
+
+  async function prepareAIDiscussionTask(runId, route) {
+    const assertRun = () => assertAIDiscussionRun(runId);
+    assertRun();
+    if (getDiscussionRoute().kind === 'detail') {
+      state.aiDiscussion.phase = 'returning';
+      refreshControls();
+      await navigateDiscussionList(route);
+      await waitForDiscussionRoute('list', route.mode, '', assertRun);
+    }
+    const listState = await waitForDiscussionList(runId, route.mode, assertRun);
+    if (!listState) throw new Error('综合讨论列表加载超时');
+    const page = randomInteger(1, listState.pageCount);
+    state.aiDiscussion.phase = 'page';
+    state.aiDiscussion.lastPage = page;
+    refreshControls();
+    const pageScope = await switchDiscussionPage(listState.scope, route.mode, page, runId, assertRun);
+    const list = getDiscussionList(pageScope || getDiscussionListScope());
+    const item = chooseAIDiscussionItem(list);
+    if (!item) throw new Error('随机页没有可用帖子');
+    const threadId = discussionItemId(item);
+    state.aiDiscussion.seenThreadIds.add(threadId);
+    state.aiDiscussion.lastThreadId = threadId;
+    state.aiDiscussion.phase = 'detail';
+    refreshControls();
+    await navigateDiscussionDetail(route, threadId);
+    await waitForDiscussionRoute('detail', route.mode, threadId, assertRun);
+    const detailScope = await waitForCondition(() => getDiscussionDetailScope(), {
+      timeout: DISCUSSION_OPERATION_TIMEOUT,
+      interval: 250,
+      assertRun,
+    });
+    if (!detailScope) throw new Error('帖子详情加载超时');
+    const title = getDiscussionTitle(detailScope) || '课程讨论';
+    const content = getDiscussionContent(detailScope);
+    if (!content) throw new Error('帖子内容为空，无法生成AI回复');
+    state.aiDiscussion.lastTitle = title;
+    state.aiDiscussion.lastContent = content;
+    state.aiDiscussion.phase = 'ai';
+    refreshControls();
+    const reply = normalizeDiscussionReply(await requestAICompletion(buildAIDiscussionMessages(title, content)));
+    assertRun();
+    if (!reply) throw new Error('AI未返回有效的纯文本讨论回复');
+    state.aiDiscussion.lastReply = reply;
+    return { threadId, title, content, reply };
+  }
+
+  function finishAIDiscussion(message) {
+    clearDiscussionExitTimer();
+    clearInterval(state.aiDiscussion.timer);
+    state.aiDiscussion.timer = null;
+    state.aiDiscussion.running = false;
+    state.aiDiscussion.phase = 'idle';
+    state.aiDiscussion.remainingMs = 0;
+    refreshControls();
+    if (message) notify(message, 3200);
+  }
+
+  function stopAIDiscussion(message = 'AI讨论已停止') {
+    state.aiDiscussion.runId += 1;
+    finishAIDiscussion(message);
+  }
+
+  async function runAIDiscussionLoop(runId, route) {
+    const assertRun = () => assertAIDiscussionRun(runId);
+    try {
+      let pending = await prepareAIDiscussionTask(runId, route);
+      while (true) {
+        assertRun();
+        state.aiDiscussion.phase = 'sending';
+        refreshControls();
+        await sendDiscussionReplyByApi(route, pending.threadId, pending.reply, assertRun);
+        state.aiDiscussion.completed += 1;
+        refreshControls();
+        if (!state.config.discussionUnlimited && state.aiDiscussion.completed >= state.aiDiscussion.target) {
+          finishAIDiscussion('AI讨论已完成' + state.aiDiscussion.completed + '次');
+          return;
+        }
+
+        const delayPromise = waitForDiscussionDelay(runId, state.aiDiscussion, assertRun);
+        const nextTaskPromise = prepareAIDiscussionTask(runId, route)
+          .then((task) => ({ task }), (error) => ({ error }));
+        await delayPromise;
+        assertRun();
+        const next = await nextTaskPromise;
+        if (next.error) throw next.error;
+        pending = next.task;
+      }
+    } catch (error) {
+      if (error && error.code === 'DISCUSSION_STOPPED') return;
+      logError('AI讨论失败', { error, route: getDiscussionRoute(), discussion: state.aiDiscussion });
+      finishAIDiscussion('AI讨论已停止：' + (error && error.message ? error.message : '页面结构或AI接口不兼容'));
+    }
+  }
+
+  function startAIDiscussion() {
+    const route = getDiscussionRoute();
+    if (route.kind !== 'list') {
+      notify('请先进入课程的综合讨论页');
+      return;
+    }
+    if (state.discussion.running || state.aiDiscussion.running) return;
+    const count = Math.max(1, Math.floor(Number(state.config.discussionCount) || 1));
+    state.config.discussionCount = count;
+    saveConfig();
+    state.aiDiscussion.running = true;
+    state.aiDiscussion.phase = 'loading';
+    state.aiDiscussion.completed = 0;
+    state.aiDiscussion.target = count;
+    state.aiDiscussion.lastPage = 0;
+    state.aiDiscussion.lastThreadId = '';
+    state.aiDiscussion.lastTitle = '';
+    state.aiDiscussion.lastContent = '';
+    state.aiDiscussion.lastReply = '';
+    state.aiDiscussion.remainingMs = 0;
+    state.aiDiscussion.seenThreadIds.clear();
+    state.aiDiscussion.runId += 1;
+    const runId = state.aiDiscussion.runId;
+    refreshControls();
+    notify(state.config.discussionUnlimited ? 'AI讨论已启动，将持续执行' : 'AI讨论已启动，共' + count + '次');
+    runAIDiscussionLoop(runId, route);
   }
 
   function getQuizDocuments() {
@@ -1106,7 +1445,7 @@
 
   function isNewAssessmentPage() {
     const isNewCourse = /^\/home\/course\/new\/\d+(?:\/|$)/i.test(location.pathname);
-    const section = location.hash.replace(/^#\/?/, '').split('/')[0].toLowerCase();
+    const section = location.hash.replace(/^#\/?/, '').split('/')[0].split(/[?#;]/)[0].toLowerCase();
     return isNewCourse && section === 'assessment';
   }
 
@@ -3298,7 +3637,7 @@
   function getControlPage() {
     const isCoursePage = /^\/home\/course\/(?:new\/)?\d+(?:\/|$)/i.test(location.pathname);
     const isLearnPage = /^\/home\/learn(?:\/|$)/i.test(location.pathname);
-    const section = location.hash.replace(/^#\/?/, '').split('/')[0].toLowerCase();
+    const section = location.hash.replace(/^#\/?/, '').split('/')[0].split(/[?#;]/)[0].toLowerCase();
     const learnQuiz = isLearnPage && (['test', 'exam'].includes(section) || hasLearnQuiz());
     return {
       playback: isLearnPage && !learnQuiz,
@@ -3429,9 +3768,13 @@
       '.fastuooc-auto-discussion-count{width:58px;height:27px;border:1px solid var(--panel-border);border-radius:6px;padding:0 7px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
       '.fastuooc-auto-discussion-unlimited{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}',
       '.fastuooc-auto-discussion-unlimited input{margin:0}',
+      '.fastuooc-auto-discussion-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}',
       '.fastuooc-auto-discussion-toggle{width:100%;height:34px;border:1px solid var(--panel-border);border-radius:8px;background:var(--button-bg);color:var(--button-text);font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
       '.fastuooc-auto-discussion-toggle:hover{background:#2563eb;border-color:#60a5fa;color:#fff}',
       '.fastuooc-auto-discussion-toggle.is-running{background:#b91c1c;border-color:#f87171;color:#fff}',
+      '.fastuooc-auto-discussion-toggle.is-ai:hover{background:#7c3aed;border-color:#a78bfa}',
+      '.fastuooc-auto-discussion-toggle.is-ai.is-running{background:#6d28d9;border-color:#c4b5fd}',
+      '.fastuooc-auto-discussion-toggle:disabled{opacity:.55;cursor:not-allowed}',
       '.fastuooc-auto-player-theme{display:inline-flex!important;align-items:center;justify-content:center;width:30px!important;height:30px!important;flex:none;border:0!important;border-radius:50%!important;padding:0!important;background:transparent!important;color:var(--panel-muted)!important;transform:none!important}',
       '.fastuooc-auto-player-theme:hover{background:var(--button-bg)!important;color:var(--panel-text)!important}',
       '.fastuooc-auto-player-theme svg{display:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}',
@@ -3522,7 +3865,10 @@
         '<label>次数 <input class="fastuooc-auto-discussion-count" data-role="discussion-count" type="number" min="1" step="1" inputmode="numeric"></label>',
         '<label class="fastuooc-auto-discussion-unlimited"><input data-action="discussion-unlimited" type="checkbox">无上限</label>',
         '</div>',
+        '<div class="fastuooc-auto-discussion-actions">',
         '<button class="fastuooc-auto-discussion-toggle" data-action="discussion-toggle" title="在综合讨论页开始或停止自动讨论">开始自动讨论</button>',
+        '<button class="fastuooc-auto-discussion-toggle is-ai" data-action="ai-discussion-toggle" title="根据帖子题目和正文生成纯文本AI讨论回复">开始AI讨论</button>',
+        '</div>',
         '</div>',
         '</div>',
         '</div>',
@@ -3544,6 +3890,7 @@
         const discussionCount = box.querySelector('[data-role="discussion-count"]');
         const discussionUnlimited = box.querySelector('[data-action="discussion-unlimited"]');
         const discussionToggle = box.querySelector('[data-action="discussion-toggle"]');
+        const aiDiscussionToggle = box.querySelector('[data-action="ai-discussion-toggle"]');
         const discussionSummary = box.querySelector('[data-role="discussion-summary"]');
         const controlPage = getControlPage();
         [enabled, next, mute, background].forEach((button) => { button.hidden = !controlPage.playback; });
@@ -3569,8 +3916,10 @@
           const aiSettings = document.getElementById('fastuooc-ai-settings');
           if (aiSettings) aiSettings.hidden = true;
         }
-        if (!controlPage.discussion && state.discussion.running) {
-          stopDiscussion('已离开综合讨论，自动讨论已停止');
+        if (!controlPage.discussion && (state.discussion.running || state.aiDiscussion.running)) {
+          scheduleDiscussionStopIfNeeded();
+        } else if (controlPage.discussion) {
+          clearDiscussionExitTimer();
         }
         const masterEnabled = state.config.enabled;
         const themeMode = ['system', 'light', 'dark'].includes(state.config.theme) ? state.config.theme : 'system';
@@ -3591,21 +3940,31 @@
         screenshot.querySelector('span').textContent = state.screenshotRunning ? '生成中…' : '长截图';
         if (document.activeElement !== discussionCount) discussionCount.value = state.config.discussionCount;
         discussionUnlimited.checked = Boolean(state.config.discussionUnlimited);
-        discussionCount.disabled = state.discussion.running || state.config.discussionUnlimited;
-        discussionUnlimited.disabled = state.discussion.running;
+        const anyDiscussionRunning = state.discussion.running || state.aiDiscussion.running;
+        discussionCount.disabled = anyDiscussionRunning || state.config.discussionUnlimited;
+        discussionUnlimited.disabled = anyDiscussionRunning;
+        discussionToggle.disabled = state.aiDiscussion.running;
+        aiDiscussionToggle.disabled = state.discussion.running;
         discussionToggle.classList.toggle('is-running', state.discussion.running);
+        aiDiscussionToggle.classList.toggle('is-running', state.aiDiscussion.running);
         discussionToggle.textContent = state.discussion.running ? '停止自动讨论' : '开始自动讨论';
-        const discussionPhase = state.discussion.phase === 'waiting'
-          ? '等待' + formatDiscussionRemaining(state.discussion.remainingMs)
-          : state.discussion.phase === 'idle' ? '未运行' : state.discussion.phase;
-        discussionSummary.textContent = state.discussion.running
-          ? state.discussion.completed + '/' + (state.config.discussionUnlimited ? '∞' : state.discussion.target) + ' · ' + discussionPhase
-          : discussionPhase;
+        aiDiscussionToggle.textContent = state.aiDiscussion.running ? '停止AI讨论' : '开始AI讨论';
+        const formatDiscussionSummary = (discussionState) => {
+          if (!discussionState.running) return discussionState.phase === 'idle' ? '未运行' : discussionState.phase;
+          const phase = discussionState.phase === 'waiting' ? '等待' : discussionState.phase;
+          const remaining = discussionState.remainingMs > 0 ? ' · 冷却' + formatDiscussionRemaining(discussionState.remainingMs) : '';
+          return discussionState.completed + '/' + (state.config.discussionUnlimited ? '∞' : discussionState.target) + ' · ' + phase + remaining;
+        };
+        discussionSummary.textContent = state.aiDiscussion.running
+          ? 'AI · ' + formatDiscussionSummary(state.aiDiscussion)
+          : formatDiscussionSummary(state.discussion);
         theme.title = `切换界面主题，当前为${themeLabel}`;
         theme.setAttribute('aria-label', theme.title);
-        const discussionDetail = state.discussion.running
-          ? '自动讨论第' + (state.discussion.completed + 1) + '次' + (state.discussion.lastPage ? ' · 第' + state.discussion.lastPage + '页' : '')
-          : '自动讨论未运行';
+        const discussionDetail = state.aiDiscussion.running
+          ? 'AI讨论第' + (state.aiDiscussion.completed + 1) + '次' + (state.aiDiscussion.lastPage ? ' · 第' + state.aiDiscussion.lastPage + '页' : '')
+          : state.discussion.running
+            ? '自动讨论第' + (state.discussion.completed + 1) + '次' + (state.discussion.lastPage ? ' · 第' + state.discussion.lastPage + '页' : '')
+            : '讨论未运行';
         box.querySelector('[data-role="state"]').textContent = masterEnabled ? `${state.config.speed}倍速 · 静音 · 后台播放 · ${themeLabel} · ${discussionDetail}` : `${state.config.speed}倍速 · ${state.config.autoNext ? '连播' : '不连播'} · ${state.config.muted ? '静音' : '有声'} · ${state.config.keepBackground ? '后台播放' : '前台播放'} · ${themeLabel} · ${discussionDetail}`;
       };
       state.controlsUpdate = update;
@@ -3686,6 +4045,12 @@
         if (action === 'discussion-toggle') {
           if (state.discussion.running) stopDiscussion();
           else startDiscussion();
+          update();
+          return;
+        }
+        if (action === 'ai-discussion-toggle') {
+          if (state.aiDiscussion.running) stopAIDiscussion();
+          else startAIDiscussion();
           update();
           return;
         }
