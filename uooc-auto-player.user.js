@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Fast UOOC
 // @namespace    fastuooc.local
-// @version      0.9.0
+// @version      0.9.1
 // @description  自动控制UOOC视频播放、课程讨论和题目导出，支持传统自动讨论、基于帖子内容生成纯文本回复的AI讨论、测验/作业/考试长截图与新版考核批量截图，并提供仅供参考的AI选项分析。
 // @homepageURL  https://greasyfork.org/zh-CN/scripts/595099-fast-uooc
 // @supportURL   https://github.com/Liunian06/fastuooc/issues/
 // @tag          uooc
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
-// @resource    fastuooc-sponsor-image https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg
+// @resource    fastuooc-sponsor-image https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg?v=0.9.1
 // @author       Liunian06
 // @license      MIT
 // @match        *://www.uooc.net.cn/home/learn/*
@@ -37,7 +37,7 @@
   'use strict';
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const SCRIPT_VERSION = '0.9.0';
+  const SCRIPT_VERSION = '0.9.1';
   const LOG_PREFIX = '[Fast UOOC v' + SCRIPT_VERSION + ']';
   const CONFIG_KEY = 'fastuooc:auto-player:config';
   const SCREENSHOT_SCALE_DEFAULT = 1.5;
@@ -46,10 +46,10 @@
   const SPONSOR_IMAGE_URL = (() => {
     try {
       return typeof GM_getResourceURL === 'function'
-        ? GM_getResourceURL('fastuooc-sponsor-image') || 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg'
-        : 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg';
+        ? GM_getResourceURL('fastuooc-sponsor-image') || 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg?v=0.9.1'
+        : 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg?v=0.9.1';
     } catch (_) {
-      return 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg';
+      return 'https://raw.githubusercontent.com/Liunian06/fastuooc/main/buymecoffee.jpg?v=0.9.1';
     }
   })();
   const ASSESSMENT_SELECTION_KEY_PREFIX = 'fastuooc:assessment-batch:selection:';
